@@ -257,9 +257,7 @@ class Hyperparameters:
     warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     warmdown_type : str = 'linear' # ['linear', 'cos', 'sqrt']
     warmdown_min_ratio : float = 0.0
-#    lrs : list[float] = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.0006, 0.0012]) # [6e-4]*5 for rwkv with adam
-#    lrs : list[float] = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.01, 0.0012]) # [6e-4]*5 for rwkv with adam
-    lrs : list[float] = field(default_factory=lambda:[6e-4]*5+[2*6e-4]) # for rwkv with adam
+    lrs : list[float] = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.0006, 0.0012])
     beta1 : float = 0.9
     beta2 : float = 0.95
     weight_decay : float = 0
@@ -273,7 +271,7 @@ class Hyperparameters:
 
 @dataclass
 class GPTConfig:
-    model_class_path:str = 'speedrun_model_gpt2.GPT'
+    model_class_path:str = 'model.gpt2.GPT'
 
     vocab_size : int = 50304
     n_layer : int = 12

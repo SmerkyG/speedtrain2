@@ -18,7 +18,7 @@ class CastedLinear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(x.dtype))
 
-class RWKV7(nn.Module):
+class RWKV7cTimeMix(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
@@ -157,7 +157,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_id):
         super().__init__()
         self.config = config
-        self.attn = RWKV7(config, layer_id)
+        self.attn = RWKV7cTimeMix(config, layer_id)
         self.mlp = MLP(config, layer_id)
         if self.config.use_block_lambdas:
             self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
