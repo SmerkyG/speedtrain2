@@ -1,0 +1,22 @@
+model:
+  model_class_path: model.rwkv7c.GPT
+  vocab_size: 65536
+  n_head: 12
+  use_skip_connections: 0
+  use_block_lambdas: 0 
+  logit_softcap: 0
+
+train:
+  warmup_iters: 10
+  warmdown_type: cos
+  input_bin: "data/minipile_rwkv/minipile_rwkv_train_*.bin"
+  input_val_bin: "data/minipile_rwkv/minipile_rwkv_val_*.bin"
+  device_batch_size: 16
+  num_iterations: 12000
+  warmdown_iters: 12000
+  warmdown_min_ratio: 0.1
+  use_muon: 0
+  weight_decay: 0.001
+  wandb: Test2
+  beta1: 0.9 
+  beta2: 0.99
