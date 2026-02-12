@@ -73,7 +73,7 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert len(G.shape) == 2 or len(G.shape) == 3
+    assert len(G.shape) >= 2 and len(G.shape) <= 4
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     X /= (X.norm(dim=[-2, -1], keepdim=True) + eps) # ensure top singular value <= 1

@@ -146,36 +146,42 @@ def zeropower_via_newtonschulz5(G: torch.Tensor) -> torch.Tensor:
         X = X.transpose(1, 2)
     return X.to(G.dtype)
 
-def _store_lagged_chunk(
-    output: torch.Tensor,
-    chunk_out: torch.Tensor,
-    *,
-    s_index: int,
-    e_index: int,
-    seq_len: int,
-    ttt_lag: int,
-) -> None:
-    if ttt_lag == 0:
-        output[:, :, s_index:e_index] = chunk_out
-        return
 
-    dst_start = s_index + ttt_lag
-    if dst_start >= seq_len:
-        return
+@MaybeCompile
+def batch_zeropower_via_newtonschulz5(G: torch.Tensor) -> torch.Tensor:
+    if G.ndim != 4:
+        raise ValueError(f"Expected a 4D tensor for muon zeropower, got shape {tuple(G.shape)}")
 
-    dst_end = e_index + ttt_lag
-    if dst_end > seq_len:
-        chunk_out = chunk_out[:, :, : seq_len - dst_start]
-        dst_end = seq_len
+    compute_dtype = torch.bfloat16 if G.is_cuda else torch.float32
+    X = G.to(compute_dtype)
+    transposed = False
+    if X.size(2) > X.size(3):
+        X = X.transpose(2, 3)
+        transposed = True
 
-    output[:, :, dst_start:dst_end] = chunk_out
+    X = X / (X.norm(dim=(2, 3), keepdim=True) + 1e-7)
+
+    for a, b, c in [
+        (4.0848, -6.8946, 2.9270),
+        (3.9505, -6.3029, 2.6377),
+        (3.7418, -5.5913, 2.3037),
+        (2.8769, -3.1427, 1.2046),
+        (2.8366, -3.0525, 1.2012),
+    ]:
+        A = X @ X.transpose(2, 3)
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if transposed:
+        X = X.transpose(2, 3)
+    return X.to(G.dtype)
 
 def silu_backprop(dy: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     sigma = torch.sigmoid(x)
     return dy * sigma * (1 + x * (1 - sigma))
 
 @MaybeCompile
-def _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr0i, lr1i, lr2i, use_muon, muon_lr_reduce_exp, muon_lr_tok, momentum, w0_norm, w1_norm, w2_norm, w0_main, w1_main, w2_main, w0, w1, w2, dw0_momentum, dw1_momentum, dw2_momentum):
+def _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr012i, use_muon, muon_lr_reduce_exp, muon_lr_tok, momentum, w012_norm, w012_main, w012, dw012_momentum):
     def _reduce_muon_lr(muon_lr_chunk: torch.Tensor) -> torch.Tensor:
         # muon_lr_chunk: [B*H, n, 1] -> [B*H, 1, 1]
         n = muon_lr_chunk.size(1)
@@ -191,9 +197,8 @@ def _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr0i, lr1i, lr2i, use_muon,
         muon_lr_i = _reduce_muon_lr(muon_lr_tok[:, s_index:e_index, :])
 
     matmul_dtype = qi.dtype
-    w0_bmm = w0.to(matmul_dtype)
-    w1_bmm = w1.to(matmul_dtype)
-    w2_bmm = w2.to(matmul_dtype)
+    w0_bmm, w1_bmm, w2_bmm = w012.to(matmul_dtype).unbind(0)
+    w1_bmm = w1_bmm.transpose(1, 2)
 
     h = torch.bmm(w2_bmm, qi)
     gate = F.silu(torch.bmm(w0_bmm, qi), inplace=True)
@@ -208,51 +213,61 @@ def _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr0i, lr1i, lr2i, use_muon,
     dgate = dhidden * hidden_before_mul
     dgate_before_act = silu_backprop(dgate, gate_before_act)
 
-    dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1i).type_as(vi)).to(w1_main.dtype)
-    dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act)).to(w0_main.dtype)
-    dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul)).to(w2_main.dtype)
+    lr0i, lr1i, lr2i = lr012i.unbind(0)
+    dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1i).type_as(vi)).to(w012.dtype)
+    dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act)).to(w012.dtype)
+    dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul)).to(w012.dtype)
+
+    dw012 = torch.stack([dw0, dw1, dw2])
 
     if momentum is not None:
         m_i = momentum[:, s_index:e_index, :].mean(dim=1, keepdim=True).to(dw0.dtype)
-        dw0 = dw0 + dw0_momentum * m_i
-        dw1 = dw1 + dw1_momentum * m_i
-        dw2 = dw2 + dw2_momentum * m_i
-        dw0_momentum = dw0
-        dw1_momentum = dw1
-        dw2_momentum = dw2
+        dw012 = dw012_momentum = dw012_momentum * m_i.unsqueeze(0) + dw012
 
     if use_muon:
-        dw1 = zeropower_via_newtonschulz5(dw1)
-        dw0 = zeropower_via_newtonschulz5(dw0)
-        dw2 = zeropower_via_newtonschulz5(dw2)
+        dw012 = batch_zeropower_via_newtonschulz5(dw012)
 
         if muon_lr_i is not None:
-            dw0 = dw0 * muon_lr_i.to(dw0.dtype)
-            dw1 = dw1 * muon_lr_i.to(dw1.dtype)
-            dw2 = dw2 * muon_lr_i.to(dw2.dtype)
+            dw012 = dw012 * muon_lr_i.to(dw012.dtype)
 
-    w0_main = w0_main + dw0
-    w1_main = w1_main + dw1
-    w2_main = w2_main + dw2
+    w012_main = w012_main + dw012
 
-    w0 = w0_main / (w0_main.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
-    w1 = w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
-    w2 = w2_main / (w2_main.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+    # pre-norm for next iteration
+    w012 = w012_main / (w012_main.norm(dim=2, keepdim=True) + 1e-5) * w012_norm
 
-    return chunk_out, w0_main, w1_main, w2_main, w0, w1, w2
+    return chunk_out, w012_main, w012, dw012_momentum
 
 @torch.compiler.disable
+def _prenorm_block_causal_lact_swiglu_loop(seq_len, chunk_size, k, v_t, q_t, lr012, use_muon, muon_lr_reduce_exp, muon_lr_tok, momentum, w012_norm, w012, dw012_momentum):
+    w012_main = w012
+    e_index = 0
+    chunks_out = []
+    for i in range(0, seq_len - chunk_size, chunk_size):
+        s_index = i
+        e_index = s_index + chunk_size
+
+        ki = k[:, s_index:e_index, :]
+        vi = v_t[:, :, s_index:e_index]
+        qi = q_t[:, :, s_index:e_index]
+        lr012i = lr012[:, :, s_index:e_index, :]
+
+        chunk_out, w012_main, w012, dw012_momentum = _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr012i, use_muon, muon_lr_reduce_exp, muon_lr_tok, momentum, w012_norm, w012_main, w012, dw012_momentum)
+        chunks_out.append(chunk_out)
+    return chunks_out, e_index
+
 def _prenorm_block_causal_lact_swiglu(
     *,
-    w0: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
+    w012,
+    # w0: torch.Tensor,
+    # w1: torch.Tensor,
+    # w2: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    lr0: torch.Tensor,
-    lr1: torch.Tensor,
-    lr2: torch.Tensor,
+    lr012,
+    # lr0: torch.Tensor,
+    # lr1: torch.Tensor,
+    # lr2: torch.Tensor,
     chunk_size: int,
     ttt_lag: int,
     use_muon: bool,
@@ -260,9 +275,7 @@ def _prenorm_block_causal_lact_swiglu(
     muon_lr_tok: Optional[torch.Tensor],  # [B*H, T, 1] or None
     muon_lr_reduce_exp: int,  # 0=sum, 1=/sqrt(n), 2=/n
 ) -> torch.Tensor:
-    w0_norm = w0.norm(dim=2, keepdim=True)
-    w1_norm = w1.norm(dim=2, keepdim=True)
-    w2_norm = w2.norm(dim=2, keepdim=True)
+    w012_norm = w012.norm(dim=-1, keepdim=True)
 
     ttt_lag = int(ttt_lag)
     if ttt_lag < 0:
@@ -271,39 +284,21 @@ def _prenorm_block_causal_lact_swiglu(
     if muon_lr_reduce_exp not in (0, 1, 2):
         raise ValueError("muon_lr_reduce_exp must be one of {0, 1, 2}.")
 
-    w0_main, w1_main, w2_main = w0, w1, w2
+    w012_main = w012
 
     #if momentum is not None:
-    dw1_momentum = torch.zeros_like(w1)
-    dw0_momentum = torch.zeros_like(w0)
-    dw2_momentum = torch.zeros_like(w2)
+    dw012_momentum = torch.zeros_like(w012)
 
     q_t = q.transpose(1, 2)
     v_t = v.transpose(1, 2)
 
-    chunks_out = []
     seq_len = k.shape[1]
-    e_index = 0
-    for i in range(0, seq_len - chunk_size, chunk_size):
-        s_index = i
-        e_index = s_index + chunk_size
+    chunks_out, s_index = _prenorm_block_causal_lact_swiglu_loop(seq_len, chunk_size, k, v_t, q_t, lr012, use_muon, muon_lr_reduce_exp, muon_lr_tok, momentum, w012_norm, w012, dw012_momentum)
 
-        ki = k[:, s_index:e_index, :]
-        vi = v_t[:, :, s_index:e_index]
-        qi = q_t[:, :, s_index:e_index]
-        lr0i = lr0[:, s_index:e_index, :]
-        lr1i = lr1[:, s_index:e_index, :]
-        lr2i = lr2[:, s_index:e_index, :]
-
-        chunk_out, w0_main, w1_main, w2_main, w0, w1, w2 = _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr0i, lr1i, lr2i, use_muon, muon_lr_reduce_exp, muon_lr_tok, momentum, w0_norm, w1_norm, w2_norm, w0_main, w1_main, w2_main, w0, w1, w2, dw0_momentum, dw1_momentum, dw2_momentum)
-        chunks_out.append(chunk_out)
-
-    s_index = e_index
     qi = q_t[:, :, s_index:seq_len]
     matmul_dtype = qi.dtype
-    w0_bmm = w0.to(matmul_dtype)
-    w1_bmm = w1.to(matmul_dtype)
-    w2_bmm = w2.to(matmul_dtype)
+    w0_bmm, w1_bmm, w2_bmm = w012.to(matmul_dtype).unbind(0)
+    w1_bmm = w1_bmm.transpose(1, 2)
     h = torch.bmm(w2_bmm, qi)
     gate = F.silu(torch.bmm(w0_bmm, qi), inplace=True)
     chunk_out = torch.bmm(w1_bmm, gate * h)
@@ -471,16 +466,8 @@ class LaCTSWIGLUSelfAttention(nn.Module):
         if d_h <= 0:
             raise ValueError("inter_multi produced a non-positive hidden dimension.")
         self.d_h = d_h
-        self.w0 = nn.Parameter(
-            torch.randn(self.num_fw_heads, d_h, d_in, dtype=torch.float32) / math.sqrt(d_in)
-        )
-        if self._ttt_has_w2:
-            self.w2 = nn.Parameter(
-                torch.randn(self.num_fw_heads, d_h, d_in, dtype=torch.float32) / math.sqrt(d_in)
-            )
-        else:
-            self.w2 = None
-        self.w1 = nn.Parameter(torch.randn(self.num_fw_heads, d_in, d_h, dtype=torch.float32) / math.sqrt(d_h))
+        # NOTE - w1 is d_in x d_h, but not in here so we transpose it as needed
+        self.w012 = nn.Parameter(torch.randn(3, self.num_fw_heads, d_h, d_in, dtype=torch.float32) / math.sqrt(d_h))
 
         self.ttt_norm = RMSNorm(self.fw_head_dim, eps=1e-5, dtype=torch.float32)
 
@@ -645,11 +632,7 @@ class LaCTSWIGLUSelfAttention(nn.Module):
         lr = self.lr_proj(x)
         lr = F.softplus(lr.float() + self.base_lr_inv)
         lr = lr.view(bsz, tsz, self.num_fw_heads, self._ttt_lr_slots, self.lr_dim).permute(3, 0, 2, 1, 4)
-        lr0 = lr[0].reshape(bsz * self.num_fw_heads, tsz, self.lr_dim)
-        lr1 = lr[1].reshape(bsz * self.num_fw_heads, tsz, self.lr_dim)
-        lr2 = None
-        if self._ttt_lr_slots == 3:
-            lr2 = lr[2].reshape(bsz * self.num_fw_heads, tsz, self.lr_dim)
+        lr012 = lr.reshape(3, bsz * self.num_fw_heads, tsz, self.lr_dim)
 
         muon_lr_tok = None
         if self.use_muon and self.learnable_muon_lr and (self.muon_lr_proj is not None):
@@ -664,19 +647,10 @@ class LaCTSWIGLUSelfAttention(nn.Module):
                 .reshape(bsz * self.num_fw_heads, tsz, 1)
             )
 
-        # if self.w0_w2_low_rank > 0:
-        #     fw_w0 = self.w0.repeat(bsz, 1, 1) # FIXME - expand instead
-        #     fw_w2 = self.w2.repeat(bsz, 1, 1) if self._ttt_has_w2 else None
-        # else:
-        fw_w0 = self.w0.repeat(bsz, 1, 1) # FIXME - expand instead
-        fw_w2 = self.w2.repeat(bsz, 1, 1) if self._ttt_has_w2 else None
-        fw_w1 = self.w1.repeat(bsz, 1, 1)
+        fw_w012 = self.w012.repeat(1, bsz, 1, 1) # FIXME - expand instead
 
         if self.fp32_states:
-            fw_w0 = fw_w0.float()
-            fw_w1 = fw_w1.float()
-            if fw_w2 is not None:
-                fw_w2 = fw_w2.float()
+            fw_w012 = fw_w012.float()
 
         if self.use_momentum:
             momentum = self.momentum_proj(x)
@@ -689,15 +663,11 @@ class LaCTSWIGLUSelfAttention(nn.Module):
         ttt_fn = _prenorm_block_causal_lact_swiglu
 
         ttt = ttt_fn(
-            w0=fw_w0,
-            w1=fw_w1,
-            w2=fw_w2,
+            w012=fw_w012,
             q=fast_q,
             k=fast_k,
             v=fast_v,
-            lr0=lr0,
-            lr1=lr1,
-            lr2=lr2,
+            lr012=lr012,
             chunk_size=self.lact_chunk_size,
             ttt_lag=self.ttt_lag,
             use_muon=self.use_muon,
