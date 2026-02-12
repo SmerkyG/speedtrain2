@@ -242,7 +242,7 @@ class DistributedDataLoader:
 # -----------------------------------------------------------------------------
 # int main
 
-@dataclass
+@dataclass(kw_only=True)
 class Hyperparameters:
     trainer : str = 'default'
     # data hyperparams
@@ -257,7 +257,7 @@ class Hyperparameters:
     warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     warmdown_type : str = 'linear' # ['linear', 'cos', 'sqrt']
     warmdown_min_ratio : float = 0.0
-    lrs : list[float] = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.0006, 0.0012])
+    lrs : list = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.0006, 0.0012])
     beta1 : float = 0.9
     beta2 : float = 0.95
     weight_decay : float = 0
@@ -266,10 +266,12 @@ class Hyperparameters:
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     use_muon : int = 1
+    grad_cp : int = 0
+    compile : int = 1
     wandb : str = ''
 
 
-@dataclass
+@dataclass(kw_only=True)
 class GPTConfig:
     model_class_path:str = 'model.gpt2.GPT'
 
@@ -279,6 +281,8 @@ class GPTConfig:
     d_embed : int = 768
 
     logit_softcap : float = 0.0
+
+    rope_theta : float = 10_000.0
 
     use_skip_connections : int = 1
     use_block_lambdas : int = 1
@@ -328,6 +332,11 @@ args.batch_size = ddp_world_size * args.device_batch_size
 model_config = cli_config.model
 model_config.sequence_length = args.sequence_length
 
+import utils.grad_cp
+utils.grad_cp.use_grad_cp = bool(args.grad_cp)
+utils.grad_cp.use_compile = bool(args.compile)
+from utils.grad_cp import CastedLinear
+
 # load module dynamically and log its code
 student_model_class, student_model_class_name, student_model_module = class_name_and_module_from_path(model_config.model_class_path)
 with open(student_model_module.__file__) as f:
@@ -337,8 +346,7 @@ with open(student_model_module.__file__) as f:
 model = student_model_class(model_config)
 model = model.cuda().bfloat16()
 for m in model.modules():
-    #if isinstance(m, CastedLinear):
-    if isinstance(m, nn.Linear): # FIXME
+    if isinstance(m, CastedLinear):
         m.float()
 
 if hasattr(config, "coordinate_descent_tuning"):
@@ -664,9 +672,17 @@ static_target = torch.empty(B, T)
 # with open(compile_artifacts_path, "wb") as file:
 #     file.write(artifact_bytes)
 
+if len(args.wandb) > 0:
+    # run a test batch before logging in to wandb
+    loss = model(x, y, return_acc=False)['loss']
+    with model.no_sync(): # there's no need to sync gradients every accumulation step
+        loss.backward()    
+    model.zero_grad(set_to_none=True)
+
 wandb_instance = None
-if master_process:
+if master_process:    
     if len(args.wandb) > 0:
+
         print("Login to wandb...")
         import wandb
         import datetime
@@ -680,6 +696,7 @@ if master_process:
         )
         wandb_instance = wandb
 
+dist.barrier() # make everyone wait so we don't get cray cray
 
 model.train() # model.eval() causes a recompile, so leave it in training mode
 

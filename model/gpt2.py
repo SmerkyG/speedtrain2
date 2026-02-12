@@ -2,24 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-def __nop(ob):
-    return ob
-
-MaybeCompile = __nop
-MaybeCompile = torch.compile
-
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention, create_mask, BlockMask, _convert_mask_to_block_mask, _create_sparse_block_from_block_mask
-
-@torch.compile(mode="max-autotune-no-cudagraphs",  fullgraph=True)
-def compiled_flex_attention(*args, **kwargs):
-    return flex_attention(*args, **kwargs)
-
-@torch.compiler.disable
-def separately_compiled_flex_attention(*args, **kwargs):
-    return compiled_flex_attention(*args, **kwargs)
-
-def causal_mask_mod(b,h,q_idx,kv_idx):
-    return kv_idx <= q_idx
+from utils.grad_cp import MaybeCompile, maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, CastedLinear
+from torch.nn.attention.flex_attention import create_block_mask
 
 @MaybeCompile
 def rms_norm(x):
@@ -28,8 +12,8 @@ def rms_norm(x):
 class GatedNorm(nn.Module):
     def __init__(self, dim:int, r:int):
         super().__init__()
-        self.W_down = nn.Linear(dim, r)
-        self.W_up = nn.Linear(r, dim)
+        self.W_down = CastedLinear(dim, r)
+        self.W_up = CastedLinear(r, dim)
 
     def forward(self, x):
         x = F.rms_norm(x, (x.size(-1),))
@@ -73,10 +57,6 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
-class CastedLinear(nn.Linear):
-    def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_id):
@@ -97,7 +77,7 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = CastedLinear(self.d_embed, self.d_embed, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        self.rotary = Rotary(self.head_dim, base=10000, seq_len=config.sequence_length)
+        self.rotary = Rotary(self.head_dim, base=config.rope_theta, seq_len=config.sequence_length)
         self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
         #self.lamb = nn.Parameter(torch.ones(self.d_embed) * 0.5)
 
@@ -108,7 +88,7 @@ class CausalSelfAttention(nn.Module):
         self.ln_x = nn.LayerNorm(config.d_embed)
 
     @MaybeCompile
-    def forward(self, residual, v1, x0, dx0):
+    def forward(self, residual, v1, x0, dx0, token_ids):
         x = self.ln_x(residual)
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         q = self.c_q(x)#.view(B, T, self.n_head, self.head_dim)
@@ -124,7 +104,7 @@ class CausalSelfAttention(nn.Module):
         q, k = rms_norm(q), rms_norm(k) # QK norm suggested by @Grad62304977
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
-        #y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        #x = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         x = separately_compiled_flex_attention(query=q.transpose(1, 2), key=k.transpose(1, 2), value=v.transpose(1, 2), block_mask=self.block_mask, enable_gqa=False)
 
         x = x.transpose(1, 2).contiguous().view_as(residual) # re-assemble all head outputs side by side
@@ -146,7 +126,7 @@ class MLP(nn.Module):
         self.ln_x = nn.LayerNorm(config.d_embed)
 
     @MaybeCompile
-    def forward(self, residual):
+    def forward(self, residual, token_ids):
         x = self.ln_x(residual)
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
@@ -324,16 +304,15 @@ class Block(nn.Module):
         if self.config.use_block_lambdas:
             self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
     
-    def forward(self, x, v1, x0, dx0):
+    def forward(self, x, v1, x0, dx0, token_ids):
         if self.config.use_block_lambdas:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = self.attn(x, v1, x0, dx0)
-        x = self.mlp(x)
+        x = self.attn(x, v1, x0, dx0, token_ids)
+        x = self.mlp(x, token_ids)
         return x
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
-
 
 class GPT(nn.Module):
 
@@ -369,15 +348,15 @@ class GPT(nn.Module):
 
 
     @MaybeCompile
-    def embed(self, idx):
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, d_embed)
+    def embed(self, token_ids):
+        x = self.transformer.wte(token_ids) # token embeddings of shape (b, t, d_embed)
         x = self.ln_emb(x) # @Grad62304977
         dx0 = F.pad(x, [0,0,1,-1]) - x
         return x, dx0
 
-    def forward(self, idx, target, return_acc=False):
+    def forward(self, token_ids, target, return_acc=False):
         # forward the GPT model itself
-        x, dx0 = self.embed(idx)
+        x, dx0 = self.embed(token_ids)
         x0 = x
         v1 = self.transformer.h[0].attn.c_v(self.transformer.h[0].attn.ln_x(x0))
 
@@ -386,7 +365,7 @@ class GPT(nn.Module):
 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            x = self.transformer.h[i](x, v1, x0, dx0)
+            x = maybe_ckpt(self.transformer.h[i], x, v1, x0, dx0, token_ids)
             if self.config.use_skip_connections:
                 skip_connections.append(x)  # Store the output for skip connections
 
@@ -395,7 +374,7 @@ class GPT(nn.Module):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
-            x = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, dx0)
+            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, v1, x0, dx0, token_ids)
 
         return self.unembed(x, target, return_acc)
 

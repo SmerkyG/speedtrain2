@@ -78,7 +78,7 @@ class RWKV7cTimeMix(nn.Module):
             self.ln_x.weight.copy_(layer_scale ** 0.7)
 
     @MaybeCompile
-    def forward(self, residual, x, v1, x0, dx0):
+    def forward(self, residual, x, x0, dx0):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H = self.n_head
         dx_prev = F.pad(x, [0,0,1,-1]) - x
@@ -162,10 +162,10 @@ class Block(nn.Module):
         if self.config.use_block_lambdas:
             self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
     
-    def forward(self, x, v1, x0, dx0):
+    def forward(self, x, x0, dx0):
         if self.config.use_block_lambdas:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = self.attn(x, self.attn.ln_x(x), v1, x0, dx0)
+        x = self.attn(x, self.attn.ln_x(x), x0, dx0)
         x = self.mlp(x, self.mlp.ln_x(x))
         return x
 
@@ -188,6 +188,8 @@ class L2Wrap(torch.autograd.Function):
         gy = torch.zeros_like(y)
         gy.scatter_(-1, ids, maxx * factor)
         return (grad_output, gy)
+
+from utils.grad_cp import maybe_ckpt
 
 class GPT(nn.Module):
 
@@ -230,14 +232,13 @@ class GPT(nn.Module):
         # forward the GPT model itself
         x, dx0 = self.embed(idx)
         x0 = x
-        v1 = self.transformer.h[0].attn.c_v(self.transformer.h[0].attn.ln_x(x0))
 
         # Store outputs for U-Net skip connections
         skip_connections = []
 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            x = self.transformer.h[i](x, v1, x0, dx0)
+            x = maybe_ckpt(self.transformer.h[i], x, x0, dx0)
             if self.config.use_skip_connections:
                 skip_connections.append(x)  # Store the output for skip connections
 
@@ -246,7 +247,7 @@ class GPT(nn.Module):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
-            x = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0, dx0)
+            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, x0, dx0)
 
         return self.unembed(x, target, return_acc)
 
