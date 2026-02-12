@@ -198,7 +198,7 @@ def _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr012i, use_muon, muon_lr_r
 
     matmul_dtype = qi.dtype
     w0_bmm, w1_bmm, w2_bmm = w012.to(matmul_dtype).unbind(0)
-    w1_bmm = w1_bmm.transpose(1, 2)
+    w1_bmm = w1_bmm.transpose(1, 2) # NOTE - transpose is because w1 is stored transposed
 
     h = torch.bmm(w2_bmm, qi)
     gate = F.silu(torch.bmm(w0_bmm, qi), inplace=True)
@@ -218,7 +218,7 @@ def _lact_swiglu_inner(s_index, e_index, ki, vi, qi, lr012i, use_muon, muon_lr_r
     dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act)).to(w012.dtype)
     dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul)).to(w012.dtype)
 
-    dw012 = torch.stack([dw0, dw1, dw2])
+    dw012 = torch.stack([dw0, dw1.transpose(1, 2), dw2]) # NOTE - transpose is because w1 is stored transposed
 
     if momentum is not None:
         m_i = momentum[:, s_index:e_index, :].mean(dim=1, keepdim=True).to(dw0.dtype)
@@ -298,7 +298,7 @@ def _prenorm_block_causal_lact_swiglu(
     qi = q_t[:, :, s_index:seq_len]
     matmul_dtype = qi.dtype
     w0_bmm, w1_bmm, w2_bmm = w012.to(matmul_dtype).unbind(0)
-    w1_bmm = w1_bmm.transpose(1, 2)
+    w1_bmm = w1_bmm.transpose(1, 2) # NOTE - transpose is because w1 is stored transposed
     h = torch.bmm(w2_bmm, qi)
     gate = F.silu(torch.bmm(w0_bmm, qi), inplace=True)
     chunk_out = torch.bmm(w1_bmm, gate * h)
