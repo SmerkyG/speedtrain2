@@ -61,6 +61,7 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
+        self.config = config
         self.n_head = config.n_head
         self.d_embed = config.d_embed
         self.head_dim = self.d_embed // self.n_head
@@ -78,8 +79,9 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = CastedLinear(self.d_embed, self.d_embed, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim, base=config.rope_theta, seq_len=config.sequence_length)
-        self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
-        #self.lamb = nn.Parameter(torch.ones(self.d_embed) * 0.5)
+        if config.use_value_residual:
+            self.lamb = nn.Parameter(torch.tensor(0.5)) # @Grad62304977
+            #self.lamb = nn.Parameter(torch.ones(self.d_embed) * 0.5)
 
         #global block_mask
         #if block_mask is None:
@@ -94,7 +96,8 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x)#.view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x)#.view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x)#.view(B, T, self.n_head, self.head_dim)
-        v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+        if self.config.use_value_residual:
+            v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
 
         q = q.view(B, T, self.n_head, self.head_dim)
         k = k.view(B, T, self.n_head, self.head_dim)
@@ -110,9 +113,7 @@ class CausalSelfAttention(nn.Module):
         x = x.transpose(1, 2).contiguous().view_as(residual) # re-assemble all head outputs side by side
         x = self.c_proj(x)
 
-        #x = (residual + x) / (1 + rms_norm(x)**2)**0.5
-        x = residual + x
-        return x
+        return residual + x
 
 class MLP(nn.Module):
 
@@ -131,8 +132,7 @@ class MLP(nn.Module):
         x = self.c_fc(x)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
-        x = residual + x
-        return x
+        return residual + x
 
 from torch.nn.attention.flex_attention import AuxRequest, _score_mod_signature
 from collections.abc import Callable
@@ -358,7 +358,9 @@ class GPT(nn.Module):
         # forward the GPT model itself
         x, dx0 = self.embed(token_ids)
         x0 = x
-        v1 = self.transformer.h[0].attn.c_v(self.transformer.h[0].attn.ln_x(x0))
+        v1 = None
+        if self.config.use_value_residual:
+            v1 = self.transformer.h[0].attn.c_v(self.transformer.h[0].attn.ln_x(x0))
 
         # Store outputs for U-Net skip connections
         skip_connections = []

@@ -280,6 +280,8 @@ class GPTConfig:
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     d_embed : int = 768
 
+    use_value_residual : int = 1
+
     logit_softcap : float = 0.0
 
     rope_theta : float = 10_000.0
@@ -403,7 +405,9 @@ scalar_params = []
 scalar_params2 = []
 scalar_params3 = []
 for n, p in raw_model.named_parameters():
-    if p.ndim >= 2:
+    if '.deep_emb.' in n:
+       scalar_params2.append(p)
+    elif p.ndim >= 2:
         matrix_params.append(p)
     else:
         if '.x_' in n or '.ln_' in n:

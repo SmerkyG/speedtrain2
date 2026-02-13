@@ -4,19 +4,7 @@ import torch.nn.functional as F
 
 from fla.ops.rwkv7.chunk import chunk_rwkv7
 
-def __nop(ob):
-    return ob
-
-MaybeCompile = __nop
-MaybeCompile = torch.compile
-
-# @torch.compile
-# def rms_norm(x):
-#     return F.rms_norm(x, (x.size(-1),))
-
-class CastedLinear(nn.Linear):
-    def forward(self, x):
-        return F.linear(x, self.weight.to(x.dtype))
+from utils.grad_cp import MaybeCompile, maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, CastedLinear
 
 class RWKV7cTimeMix(nn.Module):
 
@@ -78,7 +66,7 @@ class RWKV7cTimeMix(nn.Module):
             self.ln_x.weight.copy_(layer_scale ** 0.7)
 
     @MaybeCompile
-    def forward(self, residual, x, x0, dx0):
+    def forward(self, residual, x, x0, dx0, token_ids):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H = self.n_head
         dx_prev = F.pad(x, [0,0,1,-1]) - x
@@ -144,7 +132,7 @@ class MLP(nn.Module):
             self.ln_x.weight.copy_(layer_scale ** 0.7)
 
     @MaybeCompile
-    def forward(self, residual, x):
+    def forward(self, residual, x, token_ids):
         dx_prev = F.pad(x, [0,0,1,-1]) - x
         xk = x + dx_prev * self.x_k
         x = self.c_fc(xk) #x = self.c_fc(x)
@@ -152,6 +140,84 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return residual + x
 
+class MLPDeepEmbed(nn.Module):
+    def __init__(self, config, layer_id):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+
+        C = config.d_embed
+
+        with torch.no_grad():
+            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+            ddd = torch.ones(1, 1, C)
+            for i in range(C):
+                ddd[0, 0, i] = i / C
+            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+            self.x_de = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+
+        primes = [5099, 5101, 5107, 5113, 5119, 5147, 5153, 5167, 5171, 5179, 5189, 5197, 5209, 5227, 5231, 5233, 5237, 5261, 5273, 5279, 5281, 5297, 5303, 5309, 5323, 5333, 5347, 5351, 5381, 5387, 5393, 5399, 5407, 5413, 5417, 5419, 5431, 5437, 5441, 5443]
+        self.hash_prime = primes[0]#[layer_id]
+        self.deep_emb_size = config.vocab_size #// 4
+        DE_DIM = 32
+
+        self.key = CastedLinear(C, C * 4, bias=False)
+        nn.init.orthogonal_(self.key.weight, gain=1)
+        #self.key.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+        self.value = CastedLinear(C * 4, C, bias=False)
+        self.value.weight.data.zero_()
+
+        #self.x_s0 = nn.Parameter(torch.ones(C * 4))
+        self.x_s1 = CastedLinear(C, DE_DIM, bias=False)
+        nn.init.orthogonal_(self.x_s1.weight, gain=1)
+        #self.x_s2 = CastedLinear(DE_DIM, C * 4, bias=False)
+        #self.x_s2.weight.data.zero_()
+        self.deep_emb = nn.Embedding(self.deep_emb_size, DE_DIM*DE_DIM)
+        nn.init.orthogonal_(self.deep_emb.weight, gain=1)
+        #self.deep_emb = nn.Embedding(self.deep_emb_size, 4 * C)
+        #self.deep_emb.weight.data.zero_()
+        #with torch.no_grad():
+        #    self.deep_emb.weight.data.copy_(1.0)
+
+        self.ln_x = nn.LayerNorm(config.d_embed)
+        layer_scale = (1+layer_id) / config.n_layer
+        with torch.no_grad():
+            self.ln_x.weight.copy_(layer_scale ** 0.7)
+
+    @MaybeCompile
+    def forward(self, residual, x, token_ids):
+        B,T,C = x.shape
+        dx_prev = F.pad(x, [0,0,1,-1]) - x
+        xk = x + dx_prev * self.x_k
+        xde = x + dx_prev * self.x_de
+        if self.deep_emb_size == self.config.vocab_size:
+            emb = self.deep_emb(token_ids)
+        else:
+            emb = self.deep_emb((token_ids * self.hash_prime) % self.deep_emb_size)
+        k = self.key(xk)
+        # DE_DIM = self.x_s1.weight.shape[0]
+        # dk = self.x_s1(xde)
+        # dk = (dk.view(B,T,1,DE_DIM) @ emb.view(B,T,DE_DIM,DE_DIM)).view(B,T,DE_DIM)
+        # #k[:,:,-DE_DIM:] = k[:,:,-DE_DIM:] + dk
+        # dk = self.x_s2(dk)
+        # k = k + dk
+        #hidden = hidden + emb
+
+        DE_DIM = self.x_s1.weight.shape[0]
+        ss = self.x_s1(xde).view(B,T,1,DE_DIM)
+        emb = emb.view(B,T,DE_DIM,DE_DIM)
+        ss = (ss @ emb).view(B,T,DE_DIM)
+        #ss = ((self.x_s2(ss)) + self.x_s0)
+
+        k[:,:,-DE_DIM:] = k[:,:,-DE_DIM:] + ss
+
+        k = torch.relu(k) ** 2
+
+        #k = k * ss
+
+        v = self.value(k)
+        return residual + v
+    
 class Block(nn.Module):
 
     def __init__(self, config, layer_id):
@@ -162,11 +228,11 @@ class Block(nn.Module):
         if self.config.use_block_lambdas:
             self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
     
-    def forward(self, x, x0, dx0):
+    def forward(self, x, x0, dx0, token_ids):
         if self.config.use_block_lambdas:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = self.attn(x, self.attn.ln_x(x), x0, dx0)
-        x = self.mlp(x, self.mlp.ln_x(x))
+        x = self.attn(x, self.attn.ln_x(x), x0, dx0, token_ids)
+        x = self.mlp(x, self.mlp.ln_x(x), token_ids)
         return x
 
 # -----------------------------------------------------------------------------
@@ -188,8 +254,6 @@ class L2Wrap(torch.autograd.Function):
         gy = torch.zeros_like(y)
         gy.scatter_(-1, ids, maxx * factor)
         return (grad_output, gy)
-
-from utils.grad_cp import maybe_ckpt
 
 class GPT(nn.Module):
 
@@ -222,15 +286,15 @@ class GPT(nn.Module):
         self.ln_head = nn.LayerNorm(config.d_embed)
 
     @MaybeCompile
-    def embed(self, idx):
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, d_embed)
+    def embed(self, token_ids):
+        x = self.transformer.wte(token_ids) # token embeddings of shape (b, t, d_embed)
         x = self.ln_emb(x)
         dx0 = F.pad(x, [0,0,1,-1]) - x
         return x, dx0
 
-    def forward(self, idx, target, return_acc=False):
+    def forward(self, token_ids, target, return_acc=False):
         # forward the GPT model itself
-        x, dx0 = self.embed(idx)
+        x, dx0 = self.embed(token_ids)
         x0 = x
 
         # Store outputs for U-Net skip connections
@@ -238,7 +302,7 @@ class GPT(nn.Module):
 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            x = maybe_ckpt(self.transformer.h[i], x, x0, dx0)
+            x = maybe_ckpt(self.transformer.h[i], x, x0, dx0, token_ids)
             if self.config.use_skip_connections:
                 skip_connections.append(x)  # Store the output for skip connections
 
@@ -247,7 +311,7 @@ class GPT(nn.Module):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
-            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, x0, dx0)
+            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, x0, dx0, token_ids)
 
         return self.unembed(x, target, return_acc)
 
