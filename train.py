@@ -705,15 +705,11 @@ dist.barrier() # make everyone wait so we don't get cray cray
 model.train() # model.eval() causes a recompile, so leave it in training mode
 
 real_tokens = 0
+timed_steps = float('nan')
+training_time_ms = 0
+t0 = time.time()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
-    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-    # steps with dummy data first, and then re-initialize the model and reset the loader.
-    if step == 10:
-        training_time_ms = 0
-        t0 = time.time()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
     t_step_start = t_step_end
 
     # once in a while evaluate the validation dataset
@@ -741,11 +737,11 @@ for step in range(args.num_iterations + 1):
         #model.zero_grad(set_to_none=True) # because we are in train mode to avoid recompile
         # log val loss to console and to logfile
         if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/timed_steps:.2f}ms')
             if wandb_instance is not None:
                 wandb_instance.log({"val/loss": val_loss, "val/acc": val_acc, "tokens": real_tokens})
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/timed_steps:.2f}ms\n')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -807,23 +803,36 @@ for step in range(args.num_iterations + 1):
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        # stop the clock
         torch.cuda.synchronize()
+
+        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+        # steps with dummy data first, and then re-initialize the model and reset the loader.
+        if step <= 9:
+           # start the clock for the first time
+           training_time_ms = 0
+           t0 = time.time()
+        timed_steps = float('nan') if step <= 9 else (step - 9)
+
+        training_time_ms += 1000 * (time.time() - t0)
         t_step_end = time.time()
         step_time = 1000 * (t_step_end - t_step_start)
         step_mtok_per_sec = args.batch_size * args.sequence_length / (t_step_end - t_step_start) / 1e6
 
-        #print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms step:{step_time:.2f}")
+        #print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/timed_steps:.2f}ms step:{step_time:.2f}")
         lr_ratio = get_lr_ratio(step)
-        print(f"step:{step+1}/{args.num_iterations} loss:{train_loss.item():.4f} time:{approx_time/1000.0:.0f}s {step_mtok_per_sec:.2f}mtok/s step_time:{step_time:.2f} lr*{lr_ratio:.2f}")
+        print(f"step:{step+1}/{args.num_iterations} loss:{train_loss.item():.4f} time:{training_time_ms/1000.0:.0f}s {step_mtok_per_sec:.2f}mtok/s step_time:{step_time:.2f} lr*{lr_ratio:.2f}")
         if wandb_instance is not None:
             log_dict = {"loss": train_loss, "lr_ratio": lr_ratio, "wd": args.weight_decay, "tokens": real_tokens}
-            kt_s = approx_time/timed_steps/1000.0
+            kt_s = args.batch_size * args.sequence_length / (training_time_ms / timed_steps / 1000.0) / 1000
             if kt_s > 0:
                 log_dict["kt/s"] = kt_s
             wandb_instance.log(log_dict)
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+           f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/timed_steps:.2f}ms\n")
+        # start the clock again
+        t0 = time.time()
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
