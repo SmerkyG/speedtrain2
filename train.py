@@ -269,6 +269,7 @@ class Hyperparameters:
     grad_cp : int = 0
     compile : int = 1
     wandb : str = ''
+    strategy : str = 'ddp_find_unused_parameters'
 
 
 @dataclass(kw_only=True)
@@ -359,7 +360,7 @@ raw_model = model
 if args.trainer == 'lightning':
     raw_model = model
 else:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.strategy=='ddp_find_unused_parameters')
     raw_model = model.module # always contains the "raw" unwrapped model
 
 
@@ -788,7 +789,8 @@ for step in range(args.num_iterations + 1):
 
         real_tokens += args.batch_size * args.sequence_length
     for p in model.parameters():
-        p.grad /= train_accumulation_steps
+        if p.grad is not None:
+            p.grad /= train_accumulation_steps
     # momentum warmup for Muon
     frac = min(step/500, 1)
     optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
