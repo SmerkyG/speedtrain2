@@ -66,6 +66,20 @@ class CausalSelfAttention(nn.Module):
         self.d_embed = config.d_embed
         self.head_dim = self.d_embed // self.n_head
         assert self.d_embed % self.n_head == 0
+
+        C = config.d_embed
+        with torch.no_grad():
+            ratio_0_to_1 = layer_id / (config.n_layer - 1)  # 0 to 1
+            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+            ddd = torch.ones(C)
+            for i in range(C):
+                ddd[i] = i / C
+
+        if config.use_tokenshift:
+            self.x_q = nn.Parameter(torch.zeros_like(ddd))#ratio_1_to_almost0 * torch.ones_like(ddd))
+            self.x_k = nn.Parameter(torch.zeros_like(ddd))#ratio_1_to_almost0 * torch.ones_like(ddd))
+            self.x_v = nn.Parameter(torch.zeros_like(ddd))#ratio_1_to_almost0 * torch.ones_like(ddd))
+
         self.c_q = CastedLinear(self.d_embed, self.d_embed, bias=False)
         # with torch.no_grad():
         #     nn.init.orthogonal_(self.c_q.weight, gain=1)
@@ -93,9 +107,16 @@ class CausalSelfAttention(nn.Module):
     def forward(self, residual, v1, x0, dx0, token_ids):
         x = self.ln_x(residual)
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
-        q = self.c_q(x)#.view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x)#.view(B, T, self.n_head, self.head_dim)
-        v = self.c_v(x)#.view(B, T, self.n_head, self.head_dim)
+        dx_prev = F.pad(x, [0,0,1,-1]) - x
+        if self.config.use_tokenshift:
+            xq = x + dx_prev * self.x_q.view(1, 1, C)
+            xk = x + dx_prev * self.x_k.view(1, 1, C)
+            xv = x + dx_prev * self.x_v.view(1, 1, C)
+        else:
+            xq, xk, xv = x, x, x
+        q = self.c_q(xq)#.view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(xk)#.view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(xv)#.view(B, T, self.n_head, self.head_dim)
         if self.config.use_value_residual:
             v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
 
@@ -119,9 +140,21 @@ class MLP(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
+        self.config = config
+
+        C = config.d_embed
+
+        with torch.no_grad():
+            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+            ddd = torch.ones(C)
+            for i in range(C):
+                ddd[i] = i / C
+                
+        if config.use_tokenshift:
+            self.x_k = nn.Parameter(torch.zeros_like(ddd))#1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+
         self.c_fc    = CastedLinear(config.d_embed, 4 * config.d_embed, bias=False)
-        # with torch.no_grad():
-        #     nn.init.orthogonal_(self.c_fc.weight, gain=1)
+        # nn.init.orthogonal_(self.c_fc.weight, gain=1)
         self.c_proj  = CastedLinear(4 * config.d_embed, config.d_embed, bias=False)
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.ln_x = nn.LayerNorm(config.d_embed)
@@ -129,10 +162,101 @@ class MLP(nn.Module):
     @MaybeCompile
     def forward(self, residual, token_ids):
         x = self.ln_x(residual)
-        x = self.c_fc(x)
+        B,T,C = x.shape
+        dx_prev = F.pad(x, [0,0,1,-1]) - x
+        if self.config.use_tokenshift:
+            xk = x + dx_prev * self.x_k.view(1, 1, C)
+        else:
+            xk = x
+        x = self.c_fc(xk)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return residual + x
+
+class MLPDeepEmbed(nn.Module):
+    def __init__(self, config, layer_id):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+
+        C = config.d_embed
+
+        with torch.no_grad():
+            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+            ddd = torch.ones(C)
+            for i in range(C):
+                ddd[i] = i / C
+
+        if config.use_tokenshift:
+            self.x_k = nn.Parameter(torch.zeros_like(ddd))#1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+            self.x_de = nn.Parameter(torch.zeros_like(ddd))#1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+
+        primes = [5099, 5101, 5107, 5113, 5119, 5147, 5153, 5167, 5171, 5179, 5189, 5197, 5209, 5227, 5231, 5233, 5237, 5261, 5273, 5279, 5281, 5297, 5303, 5309, 5323, 5333, 5347, 5351, 5381, 5387, 5393, 5399, 5407, 5413, 5417, 5419, 5431, 5437, 5441, 5443]
+        self.hash_prime = primes[0]#[layer_id]
+        self.deep_emb_size = config.vocab_size #// 4
+        DE_DIM = 32
+
+        self.key = CastedLinear(C, C * 4, bias=False)
+        #nn.init.orthogonal_(self.key.weight, gain=1)
+        #self.key.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+        self.value = CastedLinear(C * 4, C, bias=False)
+        self.value.weight.data.zero_()
+
+        #self.x_s0 = nn.Parameter(torch.ones(C * 4))
+        self.x_s1 = CastedLinear(C, DE_DIM, bias=False)
+        #nn.init.orthogonal_(self.x_s1.weight, gain=1)
+        #self.x_s2 = CastedLinear(DE_DIM, C * 4, bias=False)
+        #self.x_s2.weight.data.zero_()
+        self.deep_emb = nn.Embedding(self.deep_emb_size, DE_DIM*DE_DIM)
+        nn.init.orthogonal_(self.deep_emb.weight, gain=1)
+        #self.deep_emb = nn.Embedding(self.deep_emb_size, 4 * C)
+        #self.deep_emb.weight.data.zero_()
+        #with torch.no_grad():
+        #    self.deep_emb.weight.data.copy_(1.0)
+
+        self.ln_x = nn.LayerNorm(C)
+
+    @MaybeCompile
+    def forward(self, residual, token_ids):
+        x = self.ln_x(residual)
+        B,T,C = x.shape
+        dx_prev = F.pad(x, [0,0,1,-1]) - x
+        if self.config.use_tokenshift:
+            xk = x + dx_prev * self.x_k.view(1, 1, C)
+            xde = x + dx_prev * self.x_de.view(1, 1, C)
+        else:
+            xk, xde = x, x
+        if self.deep_emb_size == self.config.vocab_size:
+            emb = self.deep_emb(token_ids)
+        else:
+            emb = self.deep_emb((token_ids * self.hash_prime) % self.deep_emb_size)
+        k = self.key(xk)
+        # DE_DIM = self.x_s1.weight.shape[0]
+        # dk = self.x_s1(xde)
+        # dk = (dk.view(B,T,1,DE_DIM) @ emb.view(B,T,DE_DIM,DE_DIM)).view(B,T,DE_DIM)
+        # #k[:,:,-DE_DIM:] = k[:,:,-DE_DIM:] + dk
+        # dk = self.x_s2(dk)
+        # k = k + dk
+        #hidden = hidden + emb
+
+        DE_DIM = self.x_s1.weight.shape[0]
+        ss = self.x_s1(xde).view(B,T,1,DE_DIM)
+        emb = emb.view(B,T,DE_DIM,DE_DIM)
+        ss = (ss @ emb).view(B,T,DE_DIM)
+        #ss = ((self.x_s2(ss)) + 1 ) #self.x_s0)
+        #ss = self.x_s2(ss)
+
+        #k = k + ss
+
+        k[:,:,-DE_DIM:] = k[:,:,-DE_DIM:] + ss
+
+        k = torch.relu(k) ** 2
+
+        #k = k * ss
+
+        v = self.value(k)
+        return residual + v
+
 
 from torch.nn.attention.flex_attention import AuxRequest, _score_mod_signature
 from collections.abc import Callable

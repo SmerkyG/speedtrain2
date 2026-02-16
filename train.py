@@ -282,6 +282,7 @@ class GPTConfig:
     d_embed : int = 768
 
     use_value_residual : int = 1
+    use_tokenshift : int = 0
 
     logit_softcap : float = 0.0
 
