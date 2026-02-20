@@ -32,26 +32,6 @@ else:
 #os.environ["TORCHINDUCTOR_DIR"] = f"/local/.torchinductor/rank_{local_rank}"
 #os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/local/.torchinductor/cache/rank_{local_rank}"
 
-from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
-
-def __nop(ob):
-    return ob
-
-#MaybeCompile = __nop
-MaybeCompile = torch.compile
-
-# @torch.compile(mode="max-autotune-no-cudagraphs",  fullgraph=True)
-# def compiled_flex_attention(query, key, value, score_mod=None, block_mask=None, enable_gqa=False):
-#     return flex_attention(query=query, key=key, value=value, score_mod=score_mod, block_mask=block_mask, enable_gqa=enable_gqa)
-
-# _compiled_flex_attention = None
-# # @torch.compiler.disable
-# def compiled_flex_attention(*args, **kwargs):
-#     global _compiled_flex_attention
-#     if _compiled_flex_attention == None:
-#         _compiled_flex_attention = torch.compile(flex_attention, mode="max-autotune-no-cudagraphs", fullgraph=True)
-#     return _compiled_flex_attention(*args, **kwargs)
-
 def causal_mask_mod(b,h,q_idx,kv_idx):
     return kv_idx <= q_idx
 
@@ -257,19 +237,28 @@ class Hyperparameters:
     warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     warmdown_type : str = 'linear' # ['linear', 'cos', 'sqrt']
     warmdown_min_ratio : float = 0.0
-    lrs : list = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.0006, 0.0012])
-    beta1 : float = 0.9
-    beta2 : float = 0.95
+    #lrs : list = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.0006, 0.0012])
+    #beta1 : float = 0.9
+    #beta2 : float = 0.95
+    opts : dict = field(default_factory=lambda: {
+        'matrix_params': dict(opt='muon', lr=0.04),
+        'wte_embed': dict(opt='adam', lr=0.6, beta1=0.9, beta2=0.95),
+        'value_embed': dict(opt='adam', lr=0.6, beta1=0.9, beta2=0.95),
+        'lm_head': dict(opt='adam', lr=0.008, beta1=0.9, beta2=0.95),
+        'scalars': dict(opt='adam', lr=0.04, beta1=0.9, beta2=0.95),
+        'scalars2': dict(opt='adam', lr=0.0006, beta1=0.9, beta2=0.95),
+        'scalars3': dict(opt='adam', lr=0.0012, beta1=0.9, beta2=0.95),
+    })
     weight_decay : float = 0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    use_muon : int = 1
+    #use_muon : int = 1
     grad_cp : int = 0
     compile : int = 1
-    wandb : str = ''
-    strategy : str = 'ddp_find_unused_parameters'
+    wandb : str = 'speedtrain'
+    strategy : str = 'ddp' #'ddp_find_unused_parameters'
 
 
 @dataclass(kw_only=True)
@@ -284,7 +273,7 @@ class GPTConfig:
     use_value_residual : int = 1
     use_tokenshift : int = 0
 
-    logit_softcap : float = 0.0
+    logit_softcap : float = 30.0
 
     rope_theta : float = 10_000.0
 
@@ -330,7 +319,6 @@ if errors != '':
     print(errors)
     exit(-1)
 
-
 args = cli_config.train
 args.batch_size = ddp_world_size * args.device_batch_size
 model_config = cli_config.model
@@ -339,7 +327,7 @@ model_config.sequence_length = args.sequence_length
 import utils.grad_cp
 utils.grad_cp.use_grad_cp = bool(args.grad_cp)
 utils.grad_cp.use_compile = bool(args.compile)
-from utils.grad_cp import CastedLinear
+from utils.grad_cp import CastedLinear, CastedEmbedding, CastedParameter, CastedLayerNorm
 
 # load module dynamically and log its code
 student_model_class, student_model_class_name, student_model_module = class_name_and_module_from_path(model_config.model_class_path)
@@ -347,15 +335,17 @@ with open(student_model_module.__file__) as f:
     model_code = f.read() # read the code of this file ASAP, for logging
 
 
-model = student_model_class(model_config)
-model = model.cuda().bfloat16()
-for m in model.modules():
-    if isinstance(m, CastedLinear):
-        m.float()
+master_dtype = torch.bfloat16
 
-if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
-#model = torch.compile(model)
+old_default_dtype = torch.get_default_dtype()
+torch.set_default_dtype(master_dtype) # this way things default to the right dtype but we can also specifically set e.g. fp8 or float weights
+with torch.device(device):
+    model = student_model_class(model_config)
+torch.set_default_dtype(old_default_dtype)
+
+#model = model.cuda().to(master_dtype)
+
+
 # here we wrap model into DDP container
 raw_model = model
 if args.trainer == 'lightning':
@@ -394,42 +384,80 @@ x, y = train_loader.next_batch()
 # enable_math_sdp(False)
 
 # init the optimizer(s)
-lrs = args.lrs
-betas = (args.beta1, args.beta2)
-optimizers = []
-optimizers += [torch.optim.Adam([raw_model.transformer.wte.weight], lr=lrs[0],   betas=betas, fused=True)]
-optimizers += [torch.optim.Adam([raw_model.lm_head.weight],         lr=lrs[1], betas=betas, fused=True)]
-#params = list(raw_model.transformer.h.parameters())
-#matrix_params = [p for p in params if p.ndim == 2]
-#scalar_params = [p for p in params if p.ndim < 2]+[raw_model.skip_weights]
-matrix_params = []
-scalar_params = []
-scalar_params2 = []
-scalar_params3 = []
+
+
+named_param_sets = {n:[] for n in args.opts.keys()}
 for n, p in raw_model.named_parameters():
-    if '.deep_emb.' in n:
-       scalar_params2.append(p)
-    elif p.ndim >= 2:
-        matrix_params.append(p)
+    label = getattr(p, 'label', None)
+    assert label is not None, f"Parameter found with missing label: {n}"
+    assert label in named_param_sets, f"Label not found in optimizer args: {label}"
+    named_param_sets[label].append(p)
+
+param_sets = list(named_param_sets.values())
+opt_arg_sets = list(args.opts.values())
+
+# from torch.optim import Optimizer
+
+# class MasterWeightOptimizer(Optimizer):
+#     def __init__(self, optimizer_cls, model_params, **optimizer_kwargs):
+#         self.model_params = list(model_params)
+#         self.master_params = [p.detach().float().requires_grad_(True) 
+#                               for p in model_params]
+#         self.optimizer = optimizer_cls(self.master_params, **optimizer_kwargs)
+
+#     @property
+#     def param_groups(self):
+#         return self.optimizer.param_groups
+
+#     @property
+#     def state(self):
+#         return self.optimizer.state
+
+#     def state_dict(self):
+#         return self.optimizer.state_dict()
+
+#     def load_state_dict(self, state_dict):
+#         self.optimizer.load_state_dict(state_dict)
+
+#     def step(self):
+#         # Copy bf16 grads -> fp32 master grads.
+#         for p, mp in zip(self.model_params, self.master_params):
+#             if p.grad is not None:
+#                 if mp.grad is None:
+#                     mp.grad = p.grad.float()
+#                 else:
+#                     mp.grad.copy_(p.grad)
+
+#         self.optimizer.step()
+        
+#         # Copy fp32 master weights -> bf16 model.
+#         with torch.no_grad():
+#             for p, mp in zip(self.model_params, self.master_params):
+#                 p.copy_(mp)
+
+#     def zero_grad(self, set_to_none = True):
+#         self.optimizer.zero_grad(set_to_none=set_to_none)
+#         if set_to_none:
+#             for p in self.model_params:
+#                 p.grad = None
+#         else:
+#             for p in self.model_params:
+#                 p.grad.zero_()
+
+
+master_param_sets = [[p.detach().clone().float() for p in model_params] for model_params in param_sets]
+optimizers = []
+for i, opt_args in enumerate(opt_arg_sets):
+    params = master_param_sets[i]
+    if len(params) == 0:
+        continue
+    #if args.use_muon and i == 2:
+    if opt_args['opt'] == 'muon':
+        optimizer = Muon(params, lr=opt_args['lr'], momentum=0.95)
     else:
-        if '.x_' in n or '.ln_' in n:
-            scalar_params2.append(p)
-        elif '.w0.' in n:
-            scalar_params3.append(p)
-        else:
-            scalar_params.append(p)
-if args.use_muon:
-    optimizer3 = Muon(matrix_params, lr=lrs[2], momentum=0.95)
-else:
-    optimizer3 = torch.optim.AdamW(matrix_params, lr=lrs[2], betas=betas, weight_decay=args.weight_decay, fused=True)
-optimizers += [optimizer3]
-if len(scalar_params) > 0: 
-    optimizers += [torch.optim.Adam(scalar_params, lr=lrs[3], betas=betas, fused=True)] # note that this learning rate is neither sensitive nor tuned
-if len(scalar_params2) > 0: 
-    optimizers += [torch.optim.Adam(scalar_params2, lr=lrs[4], betas=betas, fused=True)]
-if len(scalar_params3) > 0: 
-    optimizers += [torch.optim.Adam(scalar_params3, lr=lrs[5], betas=betas, fused=True)]
-#optimizers = [optimizer1, optimizer2, optimizer3, optimizer4, optimizer5]
+        optimizer = torch.optim.Adam(params, lr=opt_args['lr'], betas=(opt_args['beta1'], opt_args['beta2']), fused=True)
+    optimizers += [optimizer]
+
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr_ratio(it):
     def _get_lr_ratio(it):
@@ -680,6 +708,7 @@ static_target = torch.empty(B, T)
 
 if len(args.wandb) > 0:
     # run a test batch before logging in to wandb
+    #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
     loss = model(x, y, return_acc=False)['loss']
     with model.no_sync(): # there's no need to sync gradients every accumulation step
         loss.backward()    
@@ -729,6 +758,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 x_val, y_val = val_loader.next_batch()
+                #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 val_results = model(x_val, y_val, return_acc=True)
                 val_loss += val_results['loss']
                 val_acc += val_results['acc']
@@ -767,6 +797,7 @@ for step in range(args.num_iterations + 1):
         break
 
     # --------------- TRAINING SECTION BEGIN -----------------
+
     model.train()
     for i in range(1, train_accumulation_steps+1):
         #static_input.copy_(x)
@@ -776,6 +807,7 @@ for step in range(args.num_iterations + 1):
         #train_loss = static_loss.detach()
 
         # forward pass
+        #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         loss = model(x, y, return_acc=False)['loss']
         train_loss = loss.detach()
 
@@ -789,18 +821,43 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
 
         real_tokens += args.batch_size * args.sequence_length
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad /= train_accumulation_steps
-    # momentum warmup for Muon
-    frac = min(step/500, 1)
-    optimizer3.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+    
+    if train_accumulation_steps > 1:
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad /= train_accumulation_steps
+
+    for optimizer in optimizers:
+        if isinstance(optimizer, Muon):
+            # momentum warmup for Muon
+            frac = min(step/500, 1)
+            optimizer.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+        
     # step the optimizers and schedulers
+    for model_params, master_params in zip(param_sets, master_param_sets):
+        # Copy bf16 grads -> fp32 master grads.
+        for p, mp in zip(model_params, master_params):
+            mp.grad = p.grad.to(mp.dtype)
+
     for opt, sched in zip(optimizers, schedulers):
+      
         opt.step()
+
         sched.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
+
+    for model_params, master_params in zip(param_sets, master_param_sets):
+        # Copy fp32 master weights -> bf16 model.
+        with torch.no_grad():
+            for p, mp in zip(model_params, master_params):
+                p.copy_(mp)
+                p.grad = None
+                mp.grad = None
+
+    # # null the gradients
+    # model.zero_grad(set_to_none=True)
+    # for opt in optimizers:
+    #     opt.zero_grad(set_to_none=True)
+
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 

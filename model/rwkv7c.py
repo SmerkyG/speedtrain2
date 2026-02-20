@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from fla.ops.rwkv7.chunk import chunk_rwkv7
 
-from utils.grad_cp import MaybeCompile, maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, CastedLinear
+from utils.grad_cp import MaybeCompile, maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 
 class RWKV7cTimeMix(nn.Module):
 
@@ -19,17 +19,17 @@ class RWKV7cTimeMix(nn.Module):
         H = self.n_head
         N = self.head_dim
 
-        self.c_q = CastedLinear(self.d_embed, self.d_embed, bias=False)
+        self.c_q = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         #self.c_q.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
         nn.init.orthogonal_(self.c_q.weight, gain=1)
-        self.c_k = CastedLinear(self.d_embed, self.d_embed, bias=False)
+        self.c_k = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         #self.c_k.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
         nn.init.orthogonal_(self.c_k.weight, gain=0.1)
-        self.c_v = CastedLinear(self.d_embed, self.d_embed, bias=False)
+        self.c_v = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         #self.c_v.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
         nn.init.orthogonal_(self.c_q.weight, gain=1)
         # output projection
-        self.c_proj = CastedLinear(self.d_embed, self.d_embed, bias=False)
+        self.c_proj = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
         with torch.no_grad():
@@ -48,19 +48,19 @@ class RWKV7cTimeMix(nn.Module):
                 zigzag[n] = zigzag[n] * abs(zigzag[n])
                 www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
 
-        self.x_q = nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd))
-        self.x_k = nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd))
-        self.x_v = nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd))
+        self.x_q = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
+        self.x_k = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
+        self.x_v = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
 
-        self.v0 = nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4)
+        self.v0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4))
 
-        self.miss = nn.Parameter(torch.zeros(128, 4 * config.d_embed))
+        self.miss = set_label('matrix_params', nn.Parameter(torch.zeros(128, 4 * config.d_embed)))
 
-        self.w0 = nn.Parameter(www.reshape(1,1,C) + 0.5 + zigzag*2.5) # !!! 0.5 comes from F.softplus !!!
-        self.a0 = nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4)
-        self.r_k = nn.Parameter(torch.zeros(H,N)-0.04)
+        self.w0 = set_label('scalars2', nn.Parameter(www.reshape(1,1,C) + 0.5 + zigzag*2.5)) # !!! 0.5 comes from F.softplus !!!
+        self.a0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4))
+        self.r_k = set_label('scalars2', nn.Parameter(torch.zeros(H,N)-0.04))
 
-        self.ln_x = nn.LayerNorm(config.d_embed)
+        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
         layer_scale = (1+layer_id) / config.n_layer
         with torch.no_grad():
             self.ln_x.weight.copy_(layer_scale ** 0.7)
@@ -114,9 +114,9 @@ class MLP(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
-        self.c_fc    = CastedLinear(config.d_embed, 4 * config.d_embed, bias=False)
+        self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, 4 * config.d_embed, bias=False))
         nn.init.orthogonal_(self.c_fc.weight, gain=1)
-        self.c_proj  = CastedLinear(4 * config.d_embed, config.d_embed, bias=False)
+        self.c_proj  = set_label('matrix_params', nn.Linear(4 * config.d_embed, config.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
         with torch.no_grad():
@@ -124,9 +124,9 @@ class MLP(nn.Module):
             ddd = torch.ones(1, 1, config.d_embed)
             for i in range(config.d_embed):
                 ddd[0, 0, i] = i / config.d_embed
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+            self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
 
-        self.ln_x = nn.LayerNorm(config.d_embed)
+        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
         layer_scale = (1+layer_id) / config.n_layer
         with torch.no_grad():
             self.ln_x.weight.copy_(layer_scale ** 0.7)
@@ -153,26 +153,26 @@ class MLPDeepEmbed(nn.Module):
             ddd = torch.ones(1, 1, C)
             for i in range(C):
                 ddd[0, 0, i] = i / C
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
-            self.x_de = nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4))
+            self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
+            self.x_de = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
 
         primes = [5099, 5101, 5107, 5113, 5119, 5147, 5153, 5167, 5171, 5179, 5189, 5197, 5209, 5227, 5231, 5233, 5237, 5261, 5273, 5279, 5281, 5297, 5303, 5309, 5323, 5333, 5347, 5351, 5381, 5387, 5393, 5399, 5407, 5413, 5417, 5419, 5431, 5437, 5441, 5443]
         self.hash_prime = primes[0]#[layer_id]
         self.deep_emb_size = config.vocab_size #// 4
         DE_DIM = 32
 
-        self.key = CastedLinear(C, C * 4, bias=False)
+        self.key = set_label('matrix_params', nn.Linear(C, C * 4, bias=False))
         nn.init.orthogonal_(self.key.weight, gain=1)
         #self.key.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-        self.value = CastedLinear(C * 4, C, bias=False)
+        self.value = set_label('matrix_params', nn.Linear(C * 4, C, bias=False))
         self.value.weight.data.zero_()
 
         #self.x_s0 = nn.Parameter(torch.ones(C * 4))
-        self.x_s1 = CastedLinear(C, DE_DIM, bias=False)
+        self.x_s1 = set_label('matrix_params', nn.Linear(C, DE_DIM, bias=False))
         nn.init.orthogonal_(self.x_s1.weight, gain=1)
-        #self.x_s2 = CastedLinear(DE_DIM, C * 4, bias=False)
+        #self.x_s2 = set_label('matrix_params', nn.Linear(DE_DIM, C * 4, bias=False))
         #self.x_s2.weight.data.zero_()
-        self.deep_emb = nn.Embedding(self.deep_emb_size, DE_DIM*DE_DIM)
+        self.deep_emb = set_label('scalars2', nn.Embedding(self.deep_emb_size, DE_DIM*DE_DIM))
         nn.init.orthogonal_(self.deep_emb.weight, gain=1)
         #self.deep_emb = nn.Embedding(self.deep_emb_size, 4 * C)
         #self.deep_emb.weight.data.zero_()
@@ -226,7 +226,7 @@ class Block(nn.Module):
         self.attn = RWKV7cTimeMix(config, layer_id)
         self.mlp = MLP(config, layer_id)
         if self.config.use_block_lambdas:
-            self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+            self.lambdas = set_label('scalars', nn.Parameter(torch.tensor([1., 0.])))
     
     def forward(self, x, x0, dx0, token_ids):
         if self.config.use_block_lambdas:
@@ -262,7 +262,7 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.d_embed),
+            wte = set_label('wte_embed', nn.Embedding(config.vocab_size, config.d_embed)),
             h = nn.ModuleList([Block(config, layer_id) for layer_id in range(config.n_layer)]),
         ))
         nn.init.uniform_(self.transformer.wte.weight, a=-1e-4, b=1e-4)
@@ -273,17 +273,17 @@ class GPT(nn.Module):
             self.decoder_layers = config.n_layer - self.encoder_layers # Remaining for decoder
             
             # Add learnable skip connection weights for decoder layers
-            self.skip_weights = nn.Parameter(torch.ones(self.decoder_layers))
+            self.skip_weights = set_label('scalars', nn.Parameter(torch.ones(self.decoder_layers)))
         else:
             self.encoder_layers = config.n_layer
             self.decoder_layers = 0
 
-        self.lm_head = CastedLinear(config.d_embed, config.vocab_size, bias=False)
+        self.lm_head = set_label('lm_head', nn.Linear(config.d_embed, config.vocab_size, bias=False))
         #self.lm_head.weight.data.zero_() # @Grad62304977
         nn.init.orthogonal_(self.lm_head.weight, gain=0.5 * (config.vocab_size / config.d_embed)**0.5)
 
-        self.ln_emb = nn.LayerNorm(config.d_embed)
-        self.ln_head = nn.LayerNorm(config.d_embed)
+        self.ln_emb = set_label('scalars2', nn.LayerNorm(config.d_embed))
+        self.ln_head = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
     @MaybeCompile
     def embed(self, token_ids):
