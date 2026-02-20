@@ -327,7 +327,6 @@ model_config.sequence_length = args.sequence_length
 import utils.grad_cp
 utils.grad_cp.use_grad_cp = bool(args.grad_cp)
 utils.grad_cp.use_compile = bool(args.compile)
-from utils.grad_cp import CastedLinear, CastedEmbedding, CastedParameter, CastedLayerNorm
 
 # load module dynamically and log its code
 student_model_class, student_model_class_name, student_model_module = class_name_and_module_from_path(model_config.model_class_path)
