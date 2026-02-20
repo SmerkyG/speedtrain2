@@ -69,6 +69,17 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
+class EmptyOptimizer(torch.optim.Optimizer):
+    def __init__(self):
+        pass
+    def step(self):
+        pass
+    @property
+    def param_groups(self):
+        return []
+    def state_dict(self):
+        return {}
+
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -253,8 +264,8 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    val_device_batch_size : int = 64
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
-    #use_muon : int = 1
     grad_cp : int = 0
     compile : int = 1
     wandb : str = 'speedtrain'
@@ -359,15 +370,15 @@ else:
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
 # calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
+assert args.val_tokens % (args.val_device_batch_size * T * ddp_world_size) == 0
+val_steps = args.val_tokens // (args.val_device_batch_size * T * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, args.val_device_batch_size, T, ddp_rank, ddp_world_size)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
@@ -449,9 +460,8 @@ optimizers = []
 for i, opt_args in enumerate(opt_arg_sets):
     params = master_param_sets[i]
     if len(params) == 0:
-        continue
-    #if args.use_muon and i == 2:
-    if opt_args['opt'] == 'muon':
+        optimizer = EmptyOptimizer()
+    elif opt_args['opt'] == 'muon':
         optimizer = Muon(params, lr=opt_args['lr'], momentum=0.95)
     else:
         optimizer = torch.optim.Adam(params, lr=opt_args['lr'], betas=(opt_args['beta1'], opt_args['beta2']), fused=True)
@@ -798,6 +808,7 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
 
     model.train()
+
     for i in range(1, train_accumulation_steps+1):
         #static_input.copy_(x)
         #static_target.copy_(y)        
@@ -833,18 +844,15 @@ for step in range(args.num_iterations + 1):
             optimizer.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
         
     # step the optimizers and schedulers
-    for model_params, master_params in zip(param_sets, master_param_sets):
+    for model_params, master_params, opt, sched in zip(param_sets, master_param_sets, optimizers, schedulers):
         # Copy bf16 grads -> fp32 master grads.
         for p, mp in zip(model_params, master_params):
             mp.grad = p.grad.to(mp.dtype)
 
-    for opt, sched in zip(optimizers, schedulers):
-      
         opt.step()
 
         sched.step()
 
-    for model_params, master_params in zip(param_sets, master_param_sets):
         # Copy fp32 master weights -> bf16 model.
         with torch.no_grad():
             for p, mp in zip(model_params, master_params):
