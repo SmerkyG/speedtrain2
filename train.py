@@ -248,9 +248,6 @@ class Hyperparameters:
     warmdown_iters : int = 900 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     warmdown_type : str = 'linear' # ['linear', 'cos', 'sqrt']
     warmdown_min_ratio : float = 0.0
-    #lrs : list = field(default_factory=lambda:[0.6, 0.008, 0.04, 0.04, 0.0006, 0.0012])
-    #beta1 : float = 0.9
-    #beta2 : float = 0.95
     opts : dict = field(default_factory=lambda: {
         'matrix_params': dict(opt='muon', lr=0.04),
         'wte_embed': dict(opt='adam', lr=0.6, beta1=0.9, beta2=0.95),
