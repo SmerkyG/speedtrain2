@@ -161,7 +161,7 @@ def _peek_data_shard(filename):
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
     if header[0] != 20240520:
         print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Are you passing in a correct file with --train_dataset?")
         print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
         print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
@@ -215,20 +215,24 @@ class DistributedDataLoader:
         self.chunk_offsets = [ (i * self.num_processes + self.process_rank) * self.T for i in range(len(self.tokens) // (self.T * self.num_processes)) ]
         self.generator.shuffle(self.chunk_offsets)
 
-    def next_batch(self):
-        tensors = []
-        for _ in range(self.B):
-            offset = self.chunk_offsets[self.current_index]
-            buf = self.tokens[offset:offset + self.T + 1]
-            tensors.append(torch.tensor(buf.astype(np.int32), dtype=torch.long))
-            self.current_index += 1
-        batch_tensor = torch.stack(tensors)
-        inputs = batch_tensor[:, :-1].cuda().contiguous()
-        targets = batch_tensor[:, 1:].cuda().contiguous()
-        # load next shard if necessary
-        if self.current_index + self.B > len(self.chunk_offsets):
-            self.next_shard()
-        return inputs, targets
+    #def next_batch(self):
+    def __iter__(self):
+        while True:
+            tensors = []
+            for _ in range(self.B):
+                offset = self.chunk_offsets[self.current_index]
+                buf = self.tokens[offset:offset + self.T + 1]
+                tensors.append(torch.tensor(buf.astype(np.int32), dtype=torch.long))
+                self.current_index += 1
+            batch_tensor = torch.stack(tensors)
+            inputs = batch_tensor[:, :-1].cuda().contiguous()
+            targets = batch_tensor[:, 1:].cuda().contiguous()
+            # load next shard if necessary
+            if self.current_index + self.B > len(self.chunk_offsets):
+                self.next_shard()
+                if self.current_shard == 0:
+                    break
+            yield dict(input_ids=inputs, labels=targets, attention_mask=None)
 
 # -----------------------------------------------------------------------------
 # int main
@@ -237,8 +241,10 @@ class DistributedDataLoader:
 class Hyperparameters:
     trainer : str = 'default'
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on #'data/minipile/minipile_train_*.bin' 
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    data_packing : int = 0
+    train_dataset : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on #'data/minipile/minipile_train_*.bin' 
+    train_dataset_name : str|None = None # 'sample-10BT'
+    val_dataset : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = -1 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
@@ -284,6 +290,7 @@ class GPTConfig:
     logit_softcap : float = 30.0
 
     rope_theta : float = 10_000.0
+    rope_partial_dim : int = 64 # 0
 
     use_skip_connections : int = 1
     use_block_lambdas : int = 1
@@ -309,6 +316,7 @@ ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
 device = f'cuda:{ddp_local_rank}'
+old_default_device = torch.get_default_device()
 torch.cuda.set_device(device)
 torch.set_default_device(device)
 #print(f"using device: {device}")
@@ -374,12 +382,79 @@ assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
 # load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, args.val_device_batch_size, T, ddp_rank, ddp_world_size)
-if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-x, y = train_loader.next_batch()
+if args.data_packing:
+    train_data_loader = DistributedDataLoader(args.train_dataset, B, T, ddp_rank, ddp_world_size)
+    val_data_loader = DistributedDataLoader(args.val_dataset, args.val_device_batch_size, T, ddp_rank, ddp_world_size)
+    if master_process:
+        print(f"Training DataLoader: total number of tokens: {train_data_loader.ntok_total} across {len(train_data_loader.files)} files")
+        print(f"Validation DataLoader: total number of tokens: {val_data_loader.ntok_total} across {len(val_data_loader.files)} files")
+else:
+
+    from datasets import load_dataset
+    from torch.utils.data import DataLoader, Dataset
+    from transformers import AutoTokenizer, DataCollatorWithPadding
+    import torch
+    from torch.utils.data.distributed import DistributedSampler
+    from typing import List, Dict, Union
+
+    @dataclass
+    class TruncatingTokenizingCollator:
+        tokenizer: AutoTokenizer
+        max_length: int
+
+        def __call__(self, examples: List[Dict[str, Union[str, List[str]]]]) -> Dict[str, torch.Tensor]:
+            texts = [example['text'] for example in examples]
+            tokens = self.tokenizer(texts, truncation=True, max_length=self.max_length+1, padding="max_length", return_tensors='pt')
+            input_ids = tokens["input_ids"][:, :-1]
+            attention_mask = tokens["attention_mask"][:, :-1]
+            labels = tokens["input_ids"][:, 1:].clone()
+            labels[attention_mask == 0] = -100
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
+
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if not master_process:
+        torch.distributed.barrier()
+    dataset = load_dataset(args.train_dataset, name=args.train_dataset_name, split="train", streaming=False)
+    def filter_function(example):
+        return len(example['text']) >= 4*args.sequence_length
+    dataset = dataset.filter(filter_function, num_proc=max(1, os.cpu_count() - 2))
+    train_dataset = dataset.shuffle(seed=42).select(range(args.num_iterations * B * ddp_world_size))
+    val_dataset = dataset.shuffle(seed=0).select(range(val_steps * args.val_device_batch_size * ddp_world_size))
+    if master_process:
+        torch.distributed.barrier()
+
+    torch.set_default_device(old_default_device)
+
+    collator = TruncatingTokenizingCollator(tokenizer=tokenizer, max_length=args.sequence_length)
+    train_data_loader = DataLoader(
+        train_dataset,
+        batch_size=B,
+        collate_fn=collator,
+        num_workers=4,
+        pin_memory=True,
+        sampler=DistributedSampler(train_dataset, drop_last=True)
+    )
+
+    val_data_loader = DataLoader(
+        val_dataset,
+        batch_size=B,
+        collate_fn=collator,
+        num_workers=4,
+        pin_memory=True,
+        sampler=DistributedSampler(val_dataset, drop_last=True)
+    )
+
+train_loader = iter(train_data_loader)
+
+datum = next(train_loader)
+x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mask']
 
 
 
@@ -535,7 +610,7 @@ if args.trainer == 'lightning':
                 header = np.frombuffer(f.read(256*4), dtype=np.int32)
             if header[0] != 20240520:
                 print("ERROR: magic number mismatch in the data .bin file!")
-                print("---> HINT: Are you passing in a correct file with --input_bin?")
+                print("---> HINT: Are you passing in a correct file with --train_dataset?")
                 print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
                 print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
                 exit(1)
@@ -613,9 +688,8 @@ if args.trainer == 'lightning':
             #return self.optimizers
             return torch.optim.Adam(self.model.parameters(), lr=0.04, betas=betas, fused=True)
 
-    train_loader.reset()
     #train_data_loader = IterableBinIdx(train_loader)
-    train_data = DistributedDataset(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    train_data = DistributedDataset(args.train_dataset, B, T, ddp_rank, ddp_world_size)
     train_data_loader = train_data
     #train_data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=B, num_workers=4, persistent_workers=False, drop_last=True)
 
@@ -634,7 +708,6 @@ torch.cuda.synchronize()
 t0 = time.time()
 t_step_end = t0
 # begin training
-train_loader.reset()
 
 import torch.cuda
 
@@ -745,8 +818,9 @@ real_tokens = 0
 timed_steps = float('nan')
 training_time_ms = 0
 t0 = time.time()
+last_step = False
 for step in range(args.num_iterations + 1):
-    last_step = (step == args.num_iterations)
+    last_step = last_step or (step == args.num_iterations)
     t_step_start = t_step_end
 
     # once in a while evaluate the validation dataset
@@ -758,12 +832,13 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval() # this causes a recompile, so leave it in training mode
-        val_loader.reset()
+        val_loader = iter(train_data_loader)
         val_loss = 0.0
         val_acc = 0.0
         for _ in range(val_steps):
             with torch.no_grad():
-                x_val, y_val = val_loader.next_batch()
+                val_datum = next(val_loader)
+                x_val, y_val, attention_mask_val = val_datum['input_ids'], val_datum['labels'], val_datum['attention_mask']
                 #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 val_results = model(x_val, y_val, return_acc=True)
                 val_loss += val_results['loss']
@@ -819,7 +894,14 @@ for step in range(args.num_iterations + 1):
         train_loss = loss.detach()
 
         # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
+        try:
+            datum = next(train_loader)
+        except StopIteration:
+            if master_process:
+                print("Reached end of dataset. Stopping early.")
+            last_step = True
+            break
+        x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mask']
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
@@ -828,34 +910,36 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
 
         real_tokens += args.batch_size * args.sequence_length
+
+    if not last_step:
     
-    if train_accumulation_steps > 1:
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad /= train_accumulation_steps
+        if train_accumulation_steps > 1:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad /= train_accumulation_steps
 
-    for optimizer in optimizers:
-        if isinstance(optimizer, Muon):
-            # momentum warmup for Muon
-            frac = min(step/500, 1)
-            optimizer.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
-        
-    # step the optimizers and schedulers
-    for model_params, master_params, opt, sched in zip(param_sets, master_param_sets, optimizers, schedulers):
-        # Copy bf16 grads -> fp32 master grads.
-        for p, mp in zip(model_params, master_params):
-            mp.grad = p.grad.to(mp.dtype)
-
-        opt.step()
-
-        sched.step()
-
-        # Copy fp32 master weights -> bf16 model.
-        with torch.no_grad():
+        for optimizer in optimizers:
+            if isinstance(optimizer, Muon):
+                # momentum warmup for Muon
+                frac = min(step/500, 1)
+                optimizer.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+            
+        # step the optimizers and schedulers
+        for model_params, master_params, opt, sched in zip(param_sets, master_param_sets, optimizers, schedulers):
+            # Copy bf16 grads -> fp32 master grads.
             for p, mp in zip(model_params, master_params):
-                p.copy_(mp)
-                p.grad = None
-                mp.grad = None
+                mp.grad = p.grad.to(mp.dtype)
+
+            opt.step()
+
+            sched.step()
+
+            # Copy fp32 master weights -> bf16 model.
+            with torch.no_grad():
+                for p, mp in zip(model_params, master_params):
+                    p.copy_(mp)
+                    p.grad = None
+                    mp.grad = None
 
     # # null the gradients
     # model.zero_grad(set_to_none=True)
@@ -899,7 +983,10 @@ for step in range(args.num_iterations + 1):
         t0 = time.time()
 
 if master_process:
+    wandb.finish()
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+dist.barrier() # make everyone wait so wandb can finish etc.
 
 # -------------------------------------------------------------------------
 # clean up nice
