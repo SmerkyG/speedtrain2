@@ -16,6 +16,7 @@ def forgetting_attention_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
     log_f: torch.Tensor,
+    dfys: bool,
     attn_mask: torch.Tensor|None = None,
 ):
     B, H, TQ, N = q.shape
@@ -26,7 +27,8 @@ def forgetting_attention_sdpa(
     c = log_f.view(B, H, 1, TK).expand(-1, -1, TQ, -1).tril(TK-TQ)
     c = torch.cumsum(c, -1)
     c = c[:, :, :, -1:] - c # reverse cumsum
-    c[:, :, :, 0] = 0 # do not decay sink token # FIXME - this is something new and might let us avoid final att rms_norm
+    if use_dfys:
+        c[:, :, :, 0] = 0 # do not decay sink token # FIXME - this is something new and might let us avoid final att rms_norm
     c = c.to(q)
     attn_bias = c.masked_fill(~attn_mask, float('-inf'))
     y = F.scaled_dot_product_attention(q, k, v, is_causal=False, attn_mask=attn_bias)
@@ -121,8 +123,12 @@ class CausalSelfAttention(nn.Module):
         self.attn_type = 'kvm'
         assert self.attn_type in ['sdpa', 'bswa', 'kvm']
 
-        self.use_fox = True
-        self.use_rope = False
+        self.use_fox = False
+        self.use_rope = True
+        self.use_dkys = True
+        self.use_dfys = True
+
+        self.final_norm = False
 
         if self.use_fox:
             self.decay_w = set_label('matrix_params', nn.Linear(config.d_embed, self.n_head, bias=False))
@@ -154,7 +160,7 @@ class CausalSelfAttention(nn.Module):
         # code for bswa-only
         if self.attn_type == 'bswa':
             if self.use_fox:
-                return d_k, d_v, forgetting_attention_sdpa(q_current, bswa_k, bswa_v, bswa_log_f, attn_mask=causal_mask[:,-bswa_len:])
+                return d_k, d_v, forgetting_attention_sdpa(q_current, bswa_k, bswa_v, bswa_log_f, self.dfys, attn_mask=causal_mask[:,-bswa_len:])
             else:
                 return d_k, d_v, F.scaled_dot_product_attention(q_current, bswa_k, bswa_v, attn_mask=causal_mask[:,-bswa_len:], is_causal=False)
 
@@ -173,7 +179,7 @@ class CausalSelfAttention(nn.Module):
         if self.use_fox:
             d_log_f = torch.zeros_like(log_f[:,:,:chunk_len])
             log_f_star = torch.cat([d_log_f, bswa_log_f], dim=2)
-            out = forgetting_attention_sdpa(q_current, k_star, v_star, log_f_star, attn_mask=attn_mask)
+            out = forgetting_attention_sdpa(q_current, k_star, v_star, log_f_star, self.dfys, attn_mask=attn_mask)
         else:
             out = F.scaled_dot_product_attention(q_current, k_star, v_star, attn_mask=attn_mask, is_causal=False)
 
@@ -225,9 +231,14 @@ class CausalSelfAttention(nn.Module):
         q, k = rms_norm(q), rms_norm(k) # QK norm suggested by @Grad62304977
 
         if self.config.use_tokenshift_att:
-            q = q + self.x_q.view(1, 1, H, N) * (torch.cat([q[:,0:1], q[:,0:-1]], dim=1) - q)
-            k = k + self.x_k.view(1, 1, H, N) * (torch.cat([k[:,0:1], k[:,0:-1]], dim=1) - k)
-            v = v + self.x_v.view(1, 1, H, N) * (torch.cat([v[:,0:1], v[:,0:-1]], dim=1) - v)
+            if self.use_dkys:
+                q = q + self.x_q.view(1, 1, H, N) * (torch.cat([q[:,0:1], q[:,0:-1]], dim=1) - q)
+                k = k + self.x_k.view(1, 1, H, N) * (torch.cat([k[:,0:1], k[:,0:-1]], dim=1) - k)
+                v = v + self.x_v.view(1, 1, H, N) * (torch.cat([v[:,0:1], v[:,0:-1]], dim=1) - v)
+            else:
+                q = q + self.x_q.view(1, 1, H, N) * (F.pad(q, [0,0,1,-1]) - q)
+                k = k + self.x_k.view(1, 1, H, N) * (F.pad(k, [0,0,1,-1]) - k)
+                v = v + self.x_v.view(1, 1, H, N) * (F.pad(v, [0,0,1,-1]) - v)
 
         if self.use_rope:
             q, k = self.rotary(q), self.rotary(k)
@@ -268,7 +279,7 @@ class CausalSelfAttention(nn.Module):
             bswa_len = self.n_bswa_chunks * chunk_len
             max_d_len = self.n_max_d_chunks * chunk_len
             if self.use_fox:
-                outs = [forgetting_attention_sdpa(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], log_f=log_f[:,:,0:bswa_len])]
+                outs = [forgetting_attention_sdpa(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], log_f=log_f[:,:,0:bswa_len], dfys=self.dfys)]
             else:
                 outs = [F.scaled_dot_product_attention(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], is_causal=True)]
 
@@ -280,7 +291,8 @@ class CausalSelfAttention(nn.Module):
 
             y = torch.cat(outs, dim=-2)
 
-            #y = rms_norm(y) # FIXME - not needed with DFYS?
+        if self.final_norm:
+            y = rms_norm(y) # FIXME - not needed with DFYS?
 
         y = y.transpose(1, 2).contiguous().view_as(residual) # re-assemble all head outputs side by side
         y = self.c_proj(y)
