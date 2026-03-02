@@ -126,17 +126,18 @@ class Muon(torch.optim.Optimizer):
                 # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
                 if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
                     g = p.grad
-                    assert g is not None
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(1, g.size(0)/g.size(1))**0.5
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                    if g is not None: # allow unused params
+                        assert g is not None
+                        state = self.state[p]
+                        if 'momentum_buffer' not in state:
+                            state['momentum_buffer'] = torch.zeros_like(g)
+                        buf = state['momentum_buffer']
+                        buf.mul_(momentum).add_(g)
+                        if group['nesterov']:
+                            g = g.add(buf, alpha=momentum)
+                        g = zeropower_backend(g, steps=group['backend_steps'])
+                        g *= max(1, g.size(0)/g.size(1))**0.5
+                        updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
             # sync updates across devices. we are not memory-constrained so can do this simple deserialization
@@ -930,7 +931,8 @@ for step in range(args.num_iterations + 1):
         for model_params, master_params, opt, sched in zip(param_sets, master_param_sets, optimizers, schedulers):
             # Copy bf16 grads -> fp32 master grads.
             for p, mp in zip(model_params, master_params):
-                mp.grad = p.grad.to(mp.dtype)
+                if p.grad is not None:
+                    mp.grad = p.grad.to(mp.dtype)
 
             opt.step()
 
