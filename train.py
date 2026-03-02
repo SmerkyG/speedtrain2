@@ -347,6 +347,12 @@ import utils.grad_cp
 utils.grad_cp.use_grad_cp = bool(args.grad_cp)
 utils.grad_cp.use_compile = bool(args.compile)
 
+# patch torch.compile to be a no-op until we've run a test iteration of the model, to catch bugs quickly with reasonable error output
+def __no_op(ob, *args, **kwargs):
+    return ob
+_original_compile = torch.compile
+torch.compile = __no_op
+
 # load module dynamically and log its code
 student_model_class, student_model_class_name, student_model_module = class_name_and_module_from_path(model_config.model_class_path)
 with open(student_model_module.__file__) as f:
@@ -355,14 +361,48 @@ with open(student_model_module.__file__) as f:
 
 master_dtype = torch.bfloat16
 
+if master_process:
+    t0 = time.time()
+    print("Instantiating model... ", end='')
 old_default_dtype = torch.get_default_dtype()
 torch.set_default_dtype(master_dtype) # this way things default to the right dtype but we can also specifically set e.g. fp8 or float weights
 with torch.device(device):
     model = student_model_class(model_config)
 torch.set_default_dtype(old_default_dtype)
 
+if master_process:
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
+
+
+# test model quickly
+if master_process:
+    t0 = time.time()
+    print("Testing model... ", end='')
+loss = model(torch.zeros([1,args.sequence_length], dtype=torch.long), torch.zeros([1,args.sequence_length], dtype=torch.long))['loss']
+loss.backward()
+if master_process:
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
+
+if master_process:
+    t0 = time.time()
+    print("Reloading model class with torch.compile allowed... ", end='')
+
+# unpatch torch.compile and reload model code module, patching model to use reloaded class
+torch.compile = _original_compile
+importlib.reload(student_model_module)
+student_model_class, student_model_class_name, student_model_module = class_name_and_module_from_path(model_config.model_class_path)
+model.__class__ = student_model_class
+
+if master_process:
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
+
+
+
 #model = model.cuda().to(master_dtype)
 
+if master_process:
+    t0 = time.time()
+    print("Wrapping model with DDP... ", end='')    
 
 # here we wrap model into DDP container
 raw_model = model
@@ -372,6 +412,8 @@ else:
     model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=args.strategy=='ddp_find_unused_parameters')
     raw_model = model.module # always contains the "raw" unwrapped model
 
+if master_process:
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
 
 
 
@@ -383,6 +425,10 @@ val_steps = args.val_tokens // (args.val_device_batch_size * T * ddp_world_size)
 # calculate the steps of gradient accumulation required to attain the desired global batch size.
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+
+if master_process:
+    t0 = time.time()
+    print("Loading datasets... ")
 
 # load tokens
 if args.data_packing:
@@ -428,6 +474,7 @@ else:
     def filter_function(example):
         return len(example['text']) >= 4*args.sequence_length
     dataset = dataset.filter(filter_function, num_proc=max(1, os.cpu_count() - 2))
+    # NOTE - we could maybe allow the sampler to do the shuffling instead, but the 'select' should happen after shuffling and maybe having select helps processing speed??
     train_dataset = dataset.shuffle(seed=42).select(range(args.num_iterations * B * ddp_world_size))
     val_dataset = dataset.shuffle(seed=0).select(range(val_steps * args.val_device_batch_size * ddp_world_size))
     if master_process:
@@ -454,9 +501,20 @@ else:
         sampler=DistributedSampler(val_dataset, drop_last=True)
     )
 
+if master_process:
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
+
+if master_process:
+    t0 = time.time()
+    print("Loading first datum... ", end='')
+
 train_loader = iter(train_data_loader)
 
 datum = next(train_loader)
+
+if master_process:
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
+
 x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mask']
 
 
@@ -705,17 +763,9 @@ if args.trainer == 'lightning':
     exit(0)
 
 
-training_time_ms = 0
-# start the clock
-torch.cuda.synchronize()
-t0 = time.time()
-t_step_end = t0
-# begin training
 
-import torch.cuda
-
-static_input = torch.empty(B, T)
-static_target = torch.empty(B, T)
+# static_input = torch.empty(B, T)
+# static_target = torch.empty(B, T)
 # s = torch.cuda.Stream()
 # s.wait_stream(torch.cuda.current_stream())
 # with torch.cuda.stream(s):
@@ -788,13 +838,18 @@ static_target = torch.empty(B, T)
 # with open(compile_artifacts_path, "wb") as file:
 #     file.write(artifact_bytes)
 
-if len(args.wandb) > 0:
-    # run a test batch before logging in to wandb
-    #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-    loss = model(x, y, return_acc=False)['loss']
-    with model.no_sync(): # there's no need to sync gradients every accumulation step
-        loss.backward()    
-    model.zero_grad(set_to_none=True)
+# if len(args.wandb) > 0:
+#     if master_process:
+#         t0 = time.time()
+#         print("Running test batch before logging in to wandb... ", end='')
+#     # run a test batch before logging in to wandb
+#     #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+#     loss = model(x, y, return_acc=False)['loss']
+#     with model.no_sync(): # there's no need to sync gradients every accumulation step
+#         loss.backward()    
+#     model.zero_grad(set_to_none=True)
+#     if master_process:
+#         print(f"Done. {int(1000 * (time.time() - t0))}ms")
 
 wandb_instance = None
 if master_process:    
@@ -815,12 +870,19 @@ if master_process:
 
 dist.barrier() # make everyone wait so we don't get cray cray
 
+
+import torch.cuda
+
 model.train() # model.eval() causes a recompile, so leave it in training mode
 
 real_tokens = 0
 timed_steps = float('nan')
 training_time_ms = 0
+# start the clock
+torch.cuda.synchronize()
 t0 = time.time()
+t_step_end = t0
+# begin training
 last_step = False
 for step in range(args.num_iterations + 1):
     last_step = last_step or (step == args.num_iterations)
