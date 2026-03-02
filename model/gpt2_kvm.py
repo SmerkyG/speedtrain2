@@ -16,7 +16,7 @@ def forgetting_attention_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
     log_f: torch.Tensor,
-    dfys: bool,
+    use_dfys: bool,
     attn_mask: torch.Tensor|None = None,
 ):
     B, H, TQ, N = q.shape
@@ -88,9 +88,9 @@ class CausalSelfAttention(nn.Module):
                 ddd[i] = i / C
 
         if config.use_tokenshift_att:
-            self.x_q = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
-            self.x_k = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
-            self.x_v = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
+            self.x_q = set_label('matrix_params', nn.Parameter(0.5 * torch.ones(self.n_head, self.head_dim)))
+            self.x_k = set_label('matrix_params', nn.Parameter(0.5 * torch.ones(self.n_head, self.head_dim)))
+            self.x_v = set_label('matrix_params', nn.Parameter(0.5 * torch.ones(self.n_head, self.head_dim)))
 
         self.c_q = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_k = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
@@ -109,8 +109,6 @@ class CausalSelfAttention(nn.Module):
         self.n_max_d_chunks = 1
         self.n_bswa_chunks = 2
 
-        #self.dkys = True
-
         global BSWA_CHUNK_LEN, BSWA_NUM_CHUNKS
         BSWA_CHUNK_LEN = self.chunk_len
         BSWA_NUM_CHUNKS = self.n_bswa_chunks
@@ -123,8 +121,8 @@ class CausalSelfAttention(nn.Module):
         self.attn_type = 'kvm'
         assert self.attn_type in ['sdpa', 'bswa', 'kvm']
 
-        self.use_fox = False
-        self.use_rope = True
+        self.use_fox = True
+        self.use_rope = False
         self.use_dkys = True
         self.use_dfys = True
 
@@ -133,11 +131,11 @@ class CausalSelfAttention(nn.Module):
         if self.use_fox:
             self.decay_w = set_label('matrix_params', nn.Linear(config.d_embed, self.n_head, bias=False))
 
-        self.use_head_temp = False
+        self.use_head_temp = True
         if self.use_head_temp:
-            self.front_head_temp = set_label('scalars', nn.Parameter(torch.ones(config.n_head)))
+            self.front_head_temp = set_label('scalars3', nn.Parameter(torch.ones(config.n_head)))
             if self.attn_type == 'kvm':
-                self.state_head_temp = set_label('scalars', nn.Parameter(torch.ones(config.n_head)))
+                self.state_head_temp = set_label('scalars3', nn.Parameter(torch.ones(config.n_head)))
 
 
     @MaybeCompile
@@ -160,7 +158,7 @@ class CausalSelfAttention(nn.Module):
         # code for bswa-only
         if self.attn_type == 'bswa':
             if self.use_fox:
-                return d_k, d_v, forgetting_attention_sdpa(q_current, bswa_k, bswa_v, bswa_log_f, self.dfys, attn_mask=causal_mask[:,-bswa_len:])
+                return d_k, d_v, forgetting_attention_sdpa(q_current, bswa_k, bswa_v, bswa_log_f, self.use_dfys, attn_mask=causal_mask[:,-bswa_len:])
             else:
                 return d_k, d_v, F.scaled_dot_product_attention(q_current, bswa_k, bswa_v, attn_mask=causal_mask[:,-bswa_len:], is_causal=False)
 
@@ -179,7 +177,7 @@ class CausalSelfAttention(nn.Module):
         if self.use_fox:
             d_log_f = torch.zeros_like(log_f[:,:,:chunk_len])
             log_f_star = torch.cat([d_log_f, bswa_log_f], dim=2)
-            out = forgetting_attention_sdpa(q_current, k_star, v_star, log_f_star, self.dfys, attn_mask=attn_mask)
+            out = forgetting_attention_sdpa(q_current, k_star, v_star, log_f_star, self.use_dfys, attn_mask=attn_mask)
         else:
             out = F.scaled_dot_product_attention(q_current, k_star, v_star, attn_mask=attn_mask, is_causal=False)
 
@@ -208,7 +206,7 @@ class CausalSelfAttention(nn.Module):
         H = self.n_head
         N = self.head_dim
         # if self.config.use_tokenshift_att:
-        #     if self.dkys:
+        #     if self.use_dkys:
         #         dx_prev = torch.cat([x[:,0:1], x[:,0:-1]], dim=1) - x
         #     else:
         #         dx_prev = F.pad(x, [0,0,1,-1]) - x
@@ -279,7 +277,7 @@ class CausalSelfAttention(nn.Module):
             bswa_len = self.n_bswa_chunks * chunk_len
             max_d_len = self.n_max_d_chunks * chunk_len
             if self.use_fox:
-                outs = [forgetting_attention_sdpa(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], log_f=log_f[:,:,0:bswa_len], dfys=self.dfys)]
+                outs = [forgetting_attention_sdpa(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], log_f=log_f[:,:,0:bswa_len], use_dfys=self.use_dfys)]
             else:
                 outs = [F.scaled_dot_product_attention(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], is_causal=True)]
 

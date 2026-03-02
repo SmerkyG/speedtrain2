@@ -262,6 +262,7 @@ class Hyperparameters:
         'scalars': dict(opt='adam', lr=0.04, beta1=0.9, beta2=0.95),
         'scalars2': dict(opt='adam', lr=0.0006, beta1=0.9, beta2=0.95),
         'scalars3': dict(opt='adam', lr=0.0012, beta1=0.9, beta2=0.95),
+        'scalars3': dict(opt='adam', lr=0.002, beta1=0.9, beta2=0.95),
     })
     weight_decay : float = 0
     # evaluation and logging hyperparams
