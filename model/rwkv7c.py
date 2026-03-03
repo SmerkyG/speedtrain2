@@ -62,10 +62,7 @@ class RWKV7cTimeMix(nn.Module):
         self.a0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4))
         self.r_k = set_label('scalars2', nn.Parameter(torch.zeros(H,N)-0.04))
 
-        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
-        layer_scale = (1+layer_id) / config.n_layer
-        with torch.no_grad():
-            self.ln_x.weight.copy_(layer_scale ** 0.7)
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
     @defer(torch.compile)
     def forward(self, residual, x, x0, dx0, token_ids):
@@ -128,10 +125,7 @@ class MLP(nn.Module):
                 ddd[0, 0, i] = i / config.d_embed
             self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
 
-        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
-        layer_scale = (1+layer_id) / config.n_layer
-        with torch.no_grad():
-            self.ln_x.weight.copy_(layer_scale ** 0.7)
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
     @defer(torch.compile)
     def forward(self, residual, x, token_ids):
@@ -181,10 +175,7 @@ class MLPDeepEmbed(nn.Module):
         #with torch.no_grad():
         #    self.deep_emb.weight.data.copy_(1.0)
 
-        self.ln_x = nn.LayerNorm(config.d_embed)
-        layer_scale = (1+layer_id) / config.n_layer
-        with torch.no_grad():
-            self.ln_x.weight.copy_(layer_scale ** 0.7)
+        self.ln_res = nn.LayerNorm(config.d_embed)
 
     @defer(torch.compile)
     def forward(self, residual, x, token_ids):
@@ -233,8 +224,8 @@ class Block(nn.Module):
     def forward(self, x, x0, dx0, token_ids):
         if self.config.use_block_lambdas:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = self.attn(x, self.attn.ln_x(x), x0, dx0, token_ids)
-        x = self.mlp(x, self.mlp.ln_x(x), token_ids)
+        x = self.attn(x, self.attn.ln_res(x), x0, dx0, token_ids)
+        x = self.mlp(x, self.mlp.ln_res(x), token_ids)
         return x
 
 # -----------------------------------------------------------------------------
