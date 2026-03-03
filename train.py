@@ -201,37 +201,34 @@ class DistributedDataLoader:
             ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
 
-        # kick things off
-        self.reset()
+    def next_shard(self, current_shard, current_index, generator): # advance to next data shard
+        current_shard = (current_shard + 1) % len(self.files)
+        current_index = 0
+        self.tokens = _load_data_shard(self.files[current_shard])
+        chunk_offsets = [ (i * self.num_processes + self.process_rank) * self.T for i in range(len(self.tokens) // (self.T * self.num_processes)) ]
+        generator.shuffle(chunk_offsets)
+        return current_shard, current_index, chunk_offsets
 
-    def reset(self):
-        self.current_shard = -1
-        self.generator = random.Random(1234 + self.process_rank)
-        self.next_shard()
-
-    def next_shard(self): # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_index = 0
-        self.tokens = _load_data_shard(self.files[self.current_shard])
-        self.chunk_offsets = [ (i * self.num_processes + self.process_rank) * self.T for i in range(len(self.tokens) // (self.T * self.num_processes)) ]
-        self.generator.shuffle(self.chunk_offsets)
-
-    #def next_batch(self):
     def __iter__(self):
+        current_shard = -1
+        current_index = 0
+        
+        generator = random.Random(1234 + self.process_rank)
+        current_shard, current_index, chunk_offsets = self.next_shard(current_shard, current_index, generator)
         while True:
             tensors = []
             for _ in range(self.B):
-                offset = self.chunk_offsets[self.current_index]
+                offset = chunk_offsets[current_index]
                 buf = self.tokens[offset:offset + self.T + 1]
                 tensors.append(torch.tensor(buf.astype(np.int32), dtype=torch.long))
-                self.current_index += 1
+                current_index += 1
             batch_tensor = torch.stack(tensors)
             inputs = batch_tensor[:, :-1].cuda().contiguous()
             targets = batch_tensor[:, 1:].cuda().contiguous()
             # load next shard if necessary
-            if self.current_index + self.B > len(self.chunk_offsets):
-                self.next_shard()
-                if self.current_shard == 0:
+            if current_index + self.B > len(chunk_offsets):
+                current_shard, current_index, chunk_offsets = self.next_shard(current_shard, current_index, generator)
+                if current_shard == 0:
                     break
             yield dict(input_ids=inputs, labels=targets, attention_mask=None)
 
