@@ -4,7 +4,9 @@ import torch.nn.functional as F
 
 from fla.ops.rwkv7.chunk import chunk_rwkv7
 
-from utils.grad_cp import MaybeCompile, maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
+from utils.init import orthogonal_
+from utils.defer import defer
+from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 
 class RWKV7cTimeMix(nn.Module):
 
@@ -21,13 +23,13 @@ class RWKV7cTimeMix(nn.Module):
 
         self.c_q = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         #self.c_q.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-        nn.init.orthogonal_(self.c_q.weight, gain=1)
+        orthogonal_(self.c_q.weight, gain=1)
         self.c_k = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         #self.c_k.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
-        nn.init.orthogonal_(self.c_k.weight, gain=0.1)
+        orthogonal_(self.c_k.weight, gain=0.1)
         self.c_v = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         #self.c_v.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-        nn.init.orthogonal_(self.c_q.weight, gain=1)
+        orthogonal_(self.c_q.weight, gain=1)
         # output projection
         self.c_proj = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -65,7 +67,7 @@ class RWKV7cTimeMix(nn.Module):
         with torch.no_grad():
             self.ln_x.weight.copy_(layer_scale ** 0.7)
 
-    @MaybeCompile
+    @defer(torch.compile)
     def forward(self, residual, x, x0, dx0, token_ids):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H = self.n_head
@@ -115,7 +117,7 @@ class MLP(nn.Module):
     def __init__(self, config, layer_id):
         super().__init__()
         self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, 4 * config.d_embed, bias=False))
-        nn.init.orthogonal_(self.c_fc.weight, gain=1)
+        orthogonal_(self.c_fc.weight, gain=1)
         self.c_proj  = set_label('matrix_params', nn.Linear(4 * config.d_embed, config.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
@@ -131,7 +133,7 @@ class MLP(nn.Module):
         with torch.no_grad():
             self.ln_x.weight.copy_(layer_scale ** 0.7)
 
-    @MaybeCompile
+    @defer(torch.compile)
     def forward(self, residual, x, token_ids):
         dx_prev = F.pad(x, [0,0,1,-1]) - x
         xk = x + dx_prev * self.x_k
@@ -162,18 +164,18 @@ class MLPDeepEmbed(nn.Module):
         DE_DIM = 32
 
         self.key = set_label('matrix_params', nn.Linear(C, C * 4, bias=False))
-        nn.init.orthogonal_(self.key.weight, gain=1)
+        orthogonal_(self.key.weight, gain=1)
         #self.key.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
         self.value = set_label('matrix_params', nn.Linear(C * 4, C, bias=False))
         self.value.weight.data.zero_()
 
         #self.x_s0 = nn.Parameter(torch.ones(C * 4))
         self.x_s1 = set_label('matrix_params', nn.Linear(C, DE_DIM, bias=False))
-        nn.init.orthogonal_(self.x_s1.weight, gain=1)
+        orthogonal_(self.x_s1.weight, gain=1)
         #self.x_s2 = set_label('matrix_params', nn.Linear(DE_DIM, C * 4, bias=False))
         #self.x_s2.weight.data.zero_()
         self.deep_emb = set_label('scalars2', nn.Embedding(self.deep_emb_size, DE_DIM*DE_DIM))
-        nn.init.orthogonal_(self.deep_emb.weight, gain=1)
+        orthogonal_(self.deep_emb.weight, gain=1)
         #self.deep_emb = nn.Embedding(self.deep_emb_size, 4 * C)
         #self.deep_emb.weight.data.zero_()
         #with torch.no_grad():
@@ -184,7 +186,7 @@ class MLPDeepEmbed(nn.Module):
         with torch.no_grad():
             self.ln_x.weight.copy_(layer_scale ** 0.7)
 
-    @MaybeCompile
+    @defer(torch.compile)
     def forward(self, residual, x, token_ids):
         B,T,C = x.shape
         dx_prev = F.pad(x, [0,0,1,-1]) - x
@@ -280,12 +282,12 @@ class GPT(nn.Module):
 
         self.lm_head = set_label('lm_head', nn.Linear(config.d_embed, config.vocab_size, bias=False))
         #self.lm_head.weight.data.zero_() # @Grad62304977
-        nn.init.orthogonal_(self.lm_head.weight, gain=0.5 * (config.vocab_size / config.d_embed)**0.5)
+        orthogonal_(self.lm_head.weight, gain=0.5 * (config.vocab_size / config.d_embed)**0.5)
 
         self.ln_emb = set_label('scalars2', nn.LayerNorm(config.d_embed))
         self.ln_head = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
-    @MaybeCompile
+    @defer(torch.compile)
     def embed(self, token_ids):
         x = self.transformer.wte(token_ids) # token embeddings of shape (b, t, d_embed)
         x = self.ln_emb(x)
@@ -315,7 +317,7 @@ class GPT(nn.Module):
 
         return self.unembed(x, target, return_acc)
 
-    @MaybeCompile
+    @defer(torch.compile)
     def unembed(self, x, target, return_acc):
         x = self.ln_head(x)
 
