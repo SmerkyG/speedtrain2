@@ -1,4 +1,4 @@
-def defer(fn):
+def defer(inner_decorator):
     """
     Wraps any decorator so it becomes a no-op at definition time,
     but can be applied later via apply_deferred(instance).
@@ -11,9 +11,11 @@ def defer(fn):
         def forward(self, x): ...
     """
     def marker(fn):
-        fn._deferred_decorator = fn
-        return fn
-    return marker(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+        fn._deferred_decorator = inner_decorator
+        return wrapper
+    return marker
 
 
 def apply_deferred(model):
