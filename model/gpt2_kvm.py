@@ -123,8 +123,8 @@ class CausalSelfAttention(nn.Module):
         self.attn_type = 'kvm'
         assert self.attn_type in ['sdpa', 'bswa', 'kvm']
 
-        self.use_fox = True
-        self.use_rope = False
+        self.use_fox = False
+        self.use_rope = True
         self.use_dkys = True
         self.use_dfys = True
 
@@ -140,8 +140,8 @@ class CausalSelfAttention(nn.Module):
                 self.state_head_temp = set_label('scalars3', nn.Parameter(torch.ones(config.n_head)))
 
 
-    def inner_loop_attstate(self, e, q, k, v, d_k, d_v, d_vlen, log_f, causal_mask):
     @defer(torch.compile)
+    def inner_loop_attstate(self, e, q, k, v, d_k, d_v, d_vlen, log_f, causal_mask):
         chunk_len = self.chunk_len
         sink_len = self.sink_len
 
