@@ -11,10 +11,8 @@ def defer(inner_decorator):
         def forward(self, x): ...
     """
     def marker(fn):
-        def wrapper(*args, **kwargs):
-            return fn(*args, **kwargs)
         fn._deferred_decorator = inner_decorator
-        return wrapper
+        return fn
     return marker
 
 
