@@ -88,11 +88,11 @@ class RWKV7cTimeMix(nn.Module):
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
         self.receptance = set_label('matrix_params', nn.Linear(C, C, bias=False))
-        self.receptance.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+        orthogonal_(self.receptance.weight, gain=1)
         self.key = set_label('matrix_params', nn.Linear(C, C, bias=False))
-        self.key.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5)) # FIXME - seems like actual inits are 0.1
+        orthogonal_(self.key.weight, gain=0.1)
         self.value = set_label('matrix_params', nn.Linear(C, C, bias=False))
-        self.value.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
+        orthogonal_(self.value.weight, gain=1)
         self.output = set_label('matrix_params', nn.Linear(C, C, bias=False))
         self.output.weight.data.zero_()
         self.ln_x = set_label('scalars2', nn.GroupNorm(H, C, eps=64e-5)) # !!! notice eps value !!!

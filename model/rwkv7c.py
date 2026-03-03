@@ -22,14 +22,11 @@ class RWKV7cTimeMix(nn.Module):
         N = self.head_dim
 
         self.c_q = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
-        #self.c_q.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
         orthogonal_(self.c_q.weight, gain=1)
         self.c_k = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
-        #self.c_k.weight.data.uniform_(-0.05/(C**0.5), 0.05/(C**0.5))
         orthogonal_(self.c_k.weight, gain=0.1)
         self.c_v = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
-        #self.c_v.weight.data.uniform_(-0.5/(C**0.5), 0.5/(C**0.5))
-        orthogonal_(self.c_q.weight, gain=1)
+        orthogonal_(self.c_v.weight, gain=1)
         # output projection
         self.c_proj = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -50,9 +47,9 @@ class RWKV7cTimeMix(nn.Module):
                 zigzag[n] = zigzag[n] * abs(zigzag[n])
                 www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
 
-        self.x_q = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
-        self.x_k = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
-        self.x_v = set_label('scalars2', nn.Parameter(ratio_1_to_almost0 * torch.ones_like(ddd)))
+        self.x_q = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0)))
+        self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
+        self.x_v = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
 
         self.v0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4))
 
