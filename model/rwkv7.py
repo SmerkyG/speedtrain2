@@ -61,26 +61,26 @@ class RWKV7cTimeMix(nn.Module):
         # D_DECAY_LORA = 64
         D_DECAY_LORA = max(32, int(round(  (1.8*(C**0.5))  /32)*32)) # suggestion
         self.w1 = set_label('matrix_params', nn.Parameter(torch.zeros(C, D_DECAY_LORA)))
-        self.w2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.zeros(D_DECAY_LORA, C), 0.1)))
+        self.w2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.empty(D_DECAY_LORA, C), 0.1)))
         self.w0 = set_label('scalars2', nn.Parameter(www.reshape(1,1,C) + 0.5 + zigzag*2.5)) # !!! 0.5 comes from F.softplus !!!
 
         # D_AAA_LORA = 64
         D_AAA_LORA = max(32, int(round(  (1.8*(C**0.5))  /32)*32)) # suggestion
         self.a1 = set_label('matrix_params', nn.Parameter(torch.zeros(C, D_AAA_LORA)))
-        self.a2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.zeros(D_AAA_LORA, C), 0.1)))
+        self.a2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.empty(D_AAA_LORA, C), 0.1)))
         self.a0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)-0.19 + zigzag*0.3 + linear*0.4))
 
         # D_MV_LORA = 32
         D_MV_LORA = max(32, int(round(  (1.3*(C**0.5))  /32)*32)) # suggestion
         self.v1 = set_label('matrix_params', nn.Parameter(torch.zeros(C, D_MV_LORA)))
-        self.v2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.zeros(D_MV_LORA, C), 0.1)))
+        self.v2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.empty(D_MV_LORA, C), 0.1)))
         self.v0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4))
 
         # Note: for some data, you can reduce D_GATE_LORA or even remove this gate
         # D_GATE_LORA = 128
         D_GATE_LORA = max(32, int(round(  (0.6*(C**0.8))  /32)*32)) # suggestion
         self.g1 = set_label('matrix_params', nn.Parameter(torch.zeros(C, D_GATE_LORA)))
-        self.g2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.zeros(D_GATE_LORA, C), 0.1)))
+        self.g2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.empty(D_GATE_LORA, C), 0.1)))
 
         self.k_k = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)+0.71 - linear*0.1))
         self.k_a = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)+1.02))
