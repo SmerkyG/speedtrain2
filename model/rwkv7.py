@@ -96,11 +96,11 @@ class RWKV7cTimeMix(nn.Module):
         self.output = set_label('matrix_params', nn.Linear(C, C, bias=False))
         self.output.weight.data.zero_()
         self.ln_x = set_label('scalars2', nn.GroupNorm(H, C, eps=64e-5)) # !!! notice eps value !!!
-
-        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
         layer_scale = (1+layer_id) / config.n_layer
         with torch.no_grad():
             self.ln_x.weight.copy_(layer_scale ** 0.7)
+
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
     @defer(torch.compile)
     def forward(self, residual, x, v_first, x0, dx0, token_ids):
@@ -158,10 +158,7 @@ class MLP(nn.Module):
                 ddd[0, 0, i] = i / config.d_embed
             self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
 
-        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
-        layer_scale = (1+layer_id) / config.n_layer
-        with torch.no_grad():
-            self.ln_x.weight.copy_(layer_scale ** 0.7)
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
     @defer(torch.compile)
     def forward(self, residual, x, token_ids):
@@ -185,8 +182,8 @@ class Block(nn.Module):
     def forward(self, x, v_first, x0, dx0, token_ids):
         if self.config.use_block_lambdas:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = self.attn(x, self.attn.ln_x(x), v_first, x0, dx0, token_ids)
-        x = self.mlp(x, self.mlp.ln_x(x), token_ids)
+        x = self.attn(x, self.attn.ln_res(x), v_first, x0, dx0, token_ids)
+        x = self.mlp(x, self.mlp.ln_res(x), token_ids)
         return x
 
 # -----------------------------------------------------------------------------
@@ -251,7 +248,7 @@ class GPT(nn.Module):
         x, dx0 = self.embed(token_ids)
         x0 = x
 
-        v_first = self.transformer.h[0].attn.value(self.transformer.h[0].attn.ln_x(x0))
+        v_first = self.transformer.h[0].attn.value(self.transformer.h[0].attn.ln_res(x0))
 
         # Store outputs for U-Net skip connections
         skip_connections = []
