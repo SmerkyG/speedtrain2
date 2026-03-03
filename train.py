@@ -888,7 +888,7 @@ for step in range(args.num_iterations + 1):
         training_time_ms += 1000 * (time.time() - t0)
         # run validation batches
         model.eval() # this causes a recompile, so leave it in training mode
-        val_loader = iter(train_data_loader)
+        val_loader = iter(val_data_loader)
         val_loss = 0.0
         val_acc = 0.0
         for _ in range(val_steps):
