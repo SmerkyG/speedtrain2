@@ -4,10 +4,12 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 
-from utils.grad_cp import MaybeCompile, maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
+from utils.defer import defer
+
+from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 from torch.nn.attention.flex_attention import create_block_mask
 
-@MaybeCompile
+@defer(torch.compile)
 def rms_norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -138,8 +140,8 @@ class CausalSelfAttention(nn.Module):
                 self.state_head_temp = set_label('scalars3', nn.Parameter(torch.ones(config.n_head)))
 
 
-    @MaybeCompile
     def inner_loop_attstate(self, e, q, k, v, d_k, d_v, d_vlen, log_f, causal_mask):
+    @defer(torch.compile)
         chunk_len = self.chunk_len
         sink_len = self.sink_len
 
@@ -200,7 +202,7 @@ class CausalSelfAttention(nn.Module):
             d_v = d_v.scatter_add(2, best_d_idx, c_v)
         return d_k, d_v, out
 
-    @MaybeCompile
+    @defer(torch.compile)
     def forward(self, residual, x, v1, x0, dx0, token_ids):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H = self.n_head
@@ -320,7 +322,7 @@ class MLP(nn.Module):
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
-    @MaybeCompile
+    @defer(torch.compile)
     def forward(self, residual, x, token_ids):
         B,T,C = x.shape
         dx_prev = F.pad(x, [0,0,1,-1]) - x
@@ -386,7 +388,7 @@ class GPT(nn.Module):
         self.ln_head = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
 
-    @MaybeCompile
+    @defer(torch.compile)
     def embed(self, token_ids):
         x = self.transformer.wte(token_ids) # token embeddings of shape (b, t, d_embed)
         x = self.ln_emb(x) # @Grad62304977
@@ -419,7 +421,7 @@ class GPT(nn.Module):
 
         return self.unembed(x, target, return_acc)
 
-    @MaybeCompile
+    @defer(torch.compile)
     def unembed(self, x, target, return_acc):
         x = self.ln_head(x)
 

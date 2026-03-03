@@ -4,14 +4,15 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 
-from utils.grad_cp import MaybeCompile, maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
+from utils.defer import defer
+from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 from torch.nn.attention.flex_attention import create_block_mask
 
 from fla.ops.forgetting_attn.parallel import parallel_forgetting_attn
 
 from forgetting_transformer import forgetting_attention
 
-@MaybeCompile
+@defer(torch.compile)
 def rms_norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -20,14 +21,15 @@ def forgetting_attention_sdpa_channels(
     k: torch.Tensor,
     v: torch.Tensor,
     log_f: torch.Tensor,
+    use_dfys: bool,
 ):
     B, H, T, N = q.shape
     # e.g. -1, -1, -1 etc.
     c = torch.cumsum(log_f, dim=-1).view(B, H, T, 1)
     # -1, -2, -3 etc.
     c = (c * ((q.size(-1) + 2) ** 0.5)).to(q.dtype) # rescale to counteract sdpa scaling
-    c[:, :, :, 0] = 0 # do not decay sink token - this is something new and allows us to avoid final att rms_norm
     ones = torch.ones_like(c)
+    assert not use_dfys # unclear how to implement dfys here
     q = torch.cat([q, c, ones], dim=-1)
     k = torch.cat([k, ones, -c], dim=-1)
     # qc*1+-kc*1 so like -3 - -2 = -1, so add -1 from the score pre-exp, which is equivalent to multiplying the final score by e^-1
@@ -46,16 +48,21 @@ def forgetting_attention_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
     log_f: torch.Tensor,
+    use_dfys: bool,
+    attn_mask: torch.Tensor|None = None,
 ):
     B, H, T, N = q.shape
+    if attn_mask is None:
+        attn_mask = _lower_right_causal_mask(q.shape[-2], k.shape[-2], device=q.device)
 
-    causal_mask = _lower_right_causal_mask(q.shape[-2], k.shape[-2], device=q.device)
     c = log_f.view(B, H, 1, T).expand(-1, -1, T, -1).tril()
     c = torch.cumsum(c, -1)
     c = c[:, :, :, -1:] - c # reverse cumsum
     c = c.to(q)
-    attn_mask = c.masked_fill(~causal_mask, float('-inf'))
-    y = F.scaled_dot_product_attention(q, k, v, is_causal=False, attn_mask=attn_mask)
+    if use_dfys:
+        c[:, :, :, 0] = 0 # do not decay sink token - this is something new and allows us to avoid final att rms_norm
+    attn_bias = c.masked_fill(~attn_mask, float('-inf'))
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=False, attn_mask=attn_bias)
 
     return y
 
@@ -163,11 +170,15 @@ class CausalSelfAttention(nn.Module):
 
         self.sink_len = 0 #1
 
-        #self.dkys = True
-
         self.fox_type = 'sdpa'
-        assert self.fox_type in ['none', 'sdpa', 'flex', 'foxcode', 'fla']
+        assert self.fox_type in ['none', 'sdpa', 'sdpachan', 'flex', 'foxcode', 'fla']
+        self.use_dkys = True
+        self.use_dfys = True
+        self.use_exclusive_prefix_sum = True
+
         self.final_norm = False
+
+        self.use_att_gate = False
 
         if self.fox_type != 'none':
             #self.decay_base = set_label('scalars', nn.Parameter(torch.full([self.n_head], 5.5)))
@@ -176,17 +187,20 @@ class CausalSelfAttention(nn.Module):
             #    nn.init.zeros_(self.decay_w.weight)
             #    self.decay_w.weight.uniform_(-self.d_embed**0.5, self.d_embed**0.5)
 
+        if self.use_att_gate:
+            self.gate_proj = set_label('matrix_params', nn.Linear(self.d_embed, self.n_head, bias=False))
+
         self.block_mask = create_block_mask(mask_mod=causal_mask_mod, B=None, H=None, Q_LEN=config.sequence_length, KV_LEN=config.sequence_length)
 
         self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
-    @MaybeCompile
+    @defer(torch.compile)
     def forward(self, residual, x, v1, x0, dx0, token_ids):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H = self.n_head
         N = self.head_dim
         # if self.config.use_tokenshift_att:
-        #     if self.dkys:
+        #     if self.use_dkys:
         #         dx_prev = torch.cat([x[:,0:1], x[:,0:-1]], dim=1) - x
         #     else:
         #         dx_prev = F.pad(x, [0,0,1,-1]) - x
@@ -216,9 +230,14 @@ class CausalSelfAttention(nn.Module):
         q, k = rms_norm(q), rms_norm(k) # QK norm suggested by @Grad62304977
 
         if self.config.use_tokenshift_att:
-            q = q + self.x_q.view(1, 1, H, N) * (torch.cat([q[:,0:1], q[:,0:-1]], dim=1) - q)
-            k = k + self.x_k.view(1, 1, H, N) * (torch.cat([k[:,0:1], k[:,0:-1]], dim=1) - k)
-            v = v + self.x_v.view(1, 1, H, N) * (torch.cat([v[:,0:1], v[:,0:-1]], dim=1) - v)
+            if self.use_dkys:
+                q = q + self.x_q.view(1, 1, H, N) * (torch.cat([q[:,0:1], q[:,0:-1]], dim=1) - q)
+                k = k + self.x_k.view(1, 1, H, N) * (torch.cat([k[:,0:1], k[:,0:-1]], dim=1) - k)
+                v = v + self.x_v.view(1, 1, H, N) * (torch.cat([v[:,0:1], v[:,0:-1]], dim=1) - v)
+            else:
+                q = q + self.x_q.view(1, 1, H, N) * (F.pad(q, [0,0,1,-1]) - q)
+                k = k + self.x_k.view(1, 1, H, N) * (F.pad(k, [0,0,1,-1]) - k)
+                v = v + self.x_v.view(1, 1, H, N) * (F.pad(v, [0,0,1,-1]) - v)
 
 
         fox_type = self.fox_type
@@ -228,8 +247,7 @@ class CausalSelfAttention(nn.Module):
             #log_decay = F.logsigmoid(self.decay_base.view(1, 1, H).float() + self.decay_w(x).view(B, T, H).float()).clamp_min(math.log(0.005)) # NOTE - max is zero
             #log_decay = F.logsigmoid(self.decay_base.view(1, 1, H).float().repeat(B, T, 1))
 
-            exclusive_prefix_sum = True
-            if exclusive_prefix_sum:
+            if self.use_exclusive_prefix_sum:
                 log_decay = F.pad(log_decay, (0, 0, 1, -1))
 
 
@@ -249,11 +267,17 @@ class CausalSelfAttention(nn.Module):
             elif fox_type == 'flex':
                 y = forgetting_attention_flex(q, k, v, log_f=log_decay, block_mask=self.block_mask)
             elif fox_type == 'sdpa':
-                y = forgetting_attention_sdpa(q, k, v, log_f=log_decay)
+                y = forgetting_attention_sdpa(q, k, v, log_f=log_decay, use_dfys=self.use_dfys)
+            elif fox_type == 'sdpachan':
+                y = forgetting_attention_sdpa_channels(q, k, v, log_f=log_decay, use_dfys=self.use_dfys)
             #else:
             #    y = forgetting_attention(q, k, v, log_decay, head_first=False, sm_scale=1 / math.sqrt(self.head_dim), adaptive_threshold=None)
 
             y = y.transpose(1, 2)
+
+        if self.use_att_gate:
+            gate = 2 * torch.sigmoid(self.gate_proj(x).view(B, T, H, 1))
+            y = y * gate
 
         if self.final_norm:
             y = rms_norm(y)
@@ -286,7 +310,7 @@ class MLP(nn.Module):
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
-    @MaybeCompile
+    @defer(torch.compile)
     def forward(self, residual, x, token_ids):
         B,T,C = x.shape
         dx_prev = F.pad(x, [0,0,1,-1]) - x
@@ -352,7 +376,7 @@ class GPT(nn.Module):
         self.ln_head = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
 
-    @MaybeCompile
+    @defer(torch.compile)
     def embed(self, token_ids):
         x = self.transformer.wte(token_ids) # token embeddings of shape (b, t, d_embed)
         x = self.ln_emb(x) # @Grad62304977
@@ -385,7 +409,7 @@ class GPT(nn.Module):
 
         return self.unembed(x, target, return_acc)
 
-    @MaybeCompile
+    @defer(torch.compile)
     def unembed(self, x, target, return_acc):
         x = self.ln_head(x)
 

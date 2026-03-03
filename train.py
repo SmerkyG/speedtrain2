@@ -345,13 +345,6 @@ model_config.sequence_length = args.sequence_length
 
 import utils.grad_cp
 utils.grad_cp.use_grad_cp = bool(args.grad_cp)
-utils.grad_cp.use_compile = bool(args.compile)
-
-# patch torch.compile to be a no-op until we've run a test iteration of the model, to catch bugs quickly with reasonable error output
-def __no_op(ob, *args, **kwargs):
-    return ob
-_original_compile = torch.compile
-torch.compile = __no_op
 
 # load module dynamically and log its code
 student_model_class, student_model_class_name, student_model_module = class_name_and_module_from_path(model_config.model_class_path)
@@ -387,11 +380,9 @@ if master_process:
     t0 = time.time()
     print("Reloading model class with torch.compile allowed... ", end='')
 
-# unpatch torch.compile and reload model code module, patching model to use reloaded class
-torch.compile = _original_compile
-importlib.reload(student_model_module)
-student_model_class, student_model_class_name, student_model_module = class_name_and_module_from_path(model_config.model_class_path)
-model.__class__ = student_model_class
+# apply torch.compile to model where deferred
+from utils.defer import apply_deferred
+apply_deferred(model)
 
 if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
@@ -838,18 +829,18 @@ if args.trainer == 'lightning':
 # with open(compile_artifacts_path, "wb") as file:
 #     file.write(artifact_bytes)
 
-# if len(args.wandb) > 0:
-#     if master_process:
-#         t0 = time.time()
-#         print("Running test batch before logging in to wandb... ", end='')
-#     # run a test batch before logging in to wandb
-#     #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-#     loss = model(x, y, return_acc=False)['loss']
-#     with model.no_sync(): # there's no need to sync gradients every accumulation step
-#         loss.backward()    
-#     model.zero_grad(set_to_none=True)
-#     if master_process:
-#         print(f"Done. {int(1000 * (time.time() - t0))}ms")
+if len(args.wandb) > 0:
+    if master_process:
+        t0 = time.time()
+        print("Running test batch before logging in to wandb to force compile... ", end='')
+    # run a test batch before logging in to wandb
+    #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+    loss = model(x, y, return_acc=False)['loss']
+    with model.no_sync(): # there's no need to sync gradients every accumulation step
+        loss.backward()    
+    model.zero_grad(set_to_none=True)
+    if master_process:
+        print(f"Done. {int(1000 * (time.time() - t0))}ms")
 
 wandb_instance = None
 if master_process:    

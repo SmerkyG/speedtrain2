@@ -1,5 +1,3 @@
-use_compile = 1
-
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -11,25 +9,6 @@ def set_label(label, module):
         for p in module.parameters():
             p.label = label
     return module
-
-from typing import Callable
-def MaybeCompile(func, 
-                fullgraph=False,
-                dynamic=None,
-                backend="inductor",
-                mode=None,
-                options=None,
-                disable=False):
-    if not use_compile:
-        return lambda *args, **kwargs: func(*args, **kwargs)
-
-    return lambda *args, **kwargs: torch.compile(func,                         
-                        fullgraph=fullgraph,
-                        dynamic=dynamic,
-                        backend=backend,
-                        mode=mode,
-                        options=options,
-                        disable=disable)(*args, **kwargs)
 
 from torch.nn.attention.flex_attention import flex_attention
 
