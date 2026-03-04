@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from utils.init import orthogonal_
 from utils.defer import defer
 from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 
@@ -14,45 +15,32 @@ def rms_norm(x):
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
 
-class Rotary(torch.nn.Module):
-
-    def __init__(self, dim, base=10000, seq_len=None):
+class Rotary(nn.Module):
+    def __init__(self, full_dim, partial_dim, base=10000, seq_len=65536):
         super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
-        if seq_len is not None:
-            self.cache(seq_len)
+        angular_freq  = (1 / base) ** torch.linspace(0.0, 1.0, steps=partial_dim // 2, dtype=torch.float32)
+        angular_freq = angular_freq.repeat_interleave(2)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(full_dim - partial_dim)])
+        t = torch.arange(seq_len, dtype=torch.float32)
+        theta = torch.outer(t, angular_freq)
+        self.cos = nn.Buffer(theta.cos().bfloat16(), persistent=False)
+        self.sin = nn.Buffer(theta.sin().bfloat16(), persistent=False)
+        self.sin[..., 1::2] *= -1
 
-    def cache(self, seq_len, device=None):
-        if device is None:
-            device = torch.get_default_device()
-        self.seq_len_cached = seq_len
-        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
-        freqs = torch.outer(t, self.inv_freq).to(device)
-        self.cos_cached = freqs.cos().bfloat16()
-        self.sin_cached = freqs.sin().bfloat16()
-
-    def forward(self, x):
-        seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.cache(seq_len, x.device)
-        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4 # multihead attention
-    d = x.shape[3]//2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3).type_as(x)
+    def forward(self, x_BTHD):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = (
+            self.cos[None, : x_BTHD.size(-3), None, :],
+            self.sin[None, : x_BTHD.size(-3), None, :],
+        )
+        x_flip = x_BTHD.view(*x_BTHD.shape[:-1], x_BTHD.shape[-1] // 2, 2).flip(-1).view(x_BTHD.shape)
+        return cos * x_BTHD + sin * x_flip
 
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
+        self.config = config
         self.n_head = config.n_head
         self.d_embed = config.d_embed
         self.head_dim = self.d_embed // self.n_head
@@ -63,17 +51,54 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        self.rotary = Rotary(self.head_dim, base=10000, seq_len=config.sequence_length)
+        self.rope_partial_dim = config.rope_partial_dim if config.rope_partial_dim > 0 else self.head_dim
+        self.rotary = Rotary(self.head_dim, self.rope_partial_dim, base=config.rope_theta, seq_len=config.sequence_length)
 
         self.block_mask = create_block_mask(mask_mod=causal_mask_mod, B=None, H=None, Q_LEN=config.sequence_length, KV_LEN=config.sequence_length)
 
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
+
+        C = config.d_embed
+        H = self.n_head
+        N = self.head_dim
+
+        with torch.no_grad():
+            ratio_0_to_1 = layer_id / (config.n_layer - 1)  # 0 to 1
+            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+            ddd = torch.ones(1, 1, config.d_embed)
+            for i in range(config.d_embed):
+                ddd[0, 0, i] = i / config.d_embed
+
+            www = torch.zeros(C)
+            zigzag = torch.zeros(C)
+            linear = torch.zeros(C)
+            for n in range(C):
+                linear[n] = n / (C-1) - 0.5
+                zigzag[n] = ((n % N) - ((N-1) / 2)) / ((N-1) / 2)
+                zigzag[n] = zigzag[n] * abs(zigzag[n])
+                www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
+
+        if config.use_tokenshift_att:
+            self.x_q = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0)))
+            self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
+            self.x_v = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
+
     @defer(torch.compile)
-    def forward(self, residual, v1, x0, dx0):
-        x = rms_norm(residual)
+    def forward(self, residual, x, v1, x0, dx0):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
-        q = self.c_q(x)
-        k = self.c_k(x)
-        v = self.c_v(x)
+
+        if self.config.use_tokenshift_att:
+            xx = F.pad(x, [0,0,1,-1]) - x
+            #xx = torch.cat([x[:,:,0:1],x[:,:,0:-1]], dim=-1) # DKYS
+            xq = x + xx * self.x_q
+            xk = x + xx * self.x_k
+            xv = x + xx * self.x_v
+        else:
+            xq, xk, xv = x, x, x
+
+        q = self.c_q(xq)
+        k = self.c_k(xk)
+        v = self.c_v(xv)
 
         q = q.view(B, T, self.n_head, self.head_dim)
         k = k.view(B, T, self.n_head, self.head_dim)
@@ -81,11 +106,10 @@ class CausalSelfAttention(nn.Module):
 
         q, k = rms_norm(q), rms_norm(k) # QK norm suggested by @Grad62304977
 
-        cos, sin = self.rotary(q)
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = self.rotary(q), self.rotary(k)
 
-        #y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-        y = separately_compiled_flex_attention(query=q.transpose(1, 2), key=k.transpose(1, 2), value=v.transpose(1, 2), block_mask=self.block_mask, enable_gqa=False)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        #y = separately_compiled_flex_attention(query=q.transpose(1, 2), key=k.transpose(1, 2), value=v.transpose(1, 2), block_mask=self.block_mask, enable_gqa=False)
 
         y = y.transpose(1, 2).contiguous().view_as(residual) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -96,18 +120,34 @@ class MLP(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
-        self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, 4 * config.d_embed, bias=False))
-        self.c_proj  = set_label('matrix_params', nn.Linear(4 * config.d_embed, config.d_embed, bias=False))
+        self.config = config
+        d_hidden = int(config.ffn_expansion * config.d_embed)//32*32
+        self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, d_hidden, bias=False))
+        orthogonal_(self.c_fc.weight, gain=1)
+        self.c_proj  = set_label('matrix_params', nn.Linear(d_hidden, config.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
+        if config.use_tokenshift_ffn:
+            with torch.no_grad():
+                ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+                ddd = torch.ones(1, 1, config.d_embed)
+                for i in range(config.d_embed):
+                    ddd[0, 0, i] = i / config.d_embed
+                self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
+
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
+
     @defer(torch.compile)
-    def forward(self, residual):
-        x = rms_norm(residual)
-        x = self.c_fc(x)
+    def forward(self, residual, x, **kwargs):
+        dx_prev = F.pad(x, [0,0,1,-1]) - x
+        if self.config.use_tokenshift_ffn:
+            xk = x + dx_prev * self.x_k
+        else:
+            xk = x
+        x = self.c_fc(xk)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
-        x = residual + x
-        return x
+        return residual + x
 
 class Block(nn.Module):
 
@@ -117,8 +157,8 @@ class Block(nn.Module):
         self.mlp = MLP(config, layer_id)
     
     def forward(self, x, v1, x0, dx0):
-        x = self.attn(x, v1, x0, dx0)
-        x = self.mlp(x)
+        x = self.attn(x, self.attn.ln_res(x), v1, x0, dx0)
+        x = self.mlp(x, self.mlp.ln_res(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -135,9 +175,11 @@ class GPT(nn.Module):
             wte = set_label('wte_embed', nn.Embedding(config.vocab_size, config.d_embed)),
             h = nn.ModuleList([Block(config, layer_id) for layer_id in range(config.n_layer)]),
         ))
+        nn.init.uniform_(self.transformer.wte.weight, a=-1e-4, b=1e-4)
 
         self.lm_head = set_label('lm_head', nn.Linear(config.d_embed, config.vocab_size, bias=False))
-        self.lm_head.weight.data.zero_() # @Grad62304977
+        #self.lm_head.weight.data.zero_() # @Grad62304977
+        orthogonal_(self.lm_head.weight, gain=0.5 * (config.vocab_size / config.d_embed)**0.5)
 
         self.ln_emb = set_label('scalars2', nn.LayerNorm(config.d_embed))
         self.ln_head = set_label('scalars2', nn.LayerNorm(config.d_embed))
@@ -171,6 +213,7 @@ class GPT(nn.Module):
             logits = self.config.logit_softcap * torch.tanh(logits / self.config.logit_softcap) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        loss = loss.float()
 
         acc = None
         if return_acc:

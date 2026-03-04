@@ -1,27 +1,27 @@
 model:
-  model_class_path: model.rwkv7c.GPT
-  vocab_size: 65536
+  model_class_path: model.gpt2_simple_ln.GPT
+  vocab_size: 50304
   n_head: 12
   use_skip_connections: 0
   use_block_lambdas: 0 
   logit_softcap: 0
-  use_l2wrap: 1
-  use_tokenshift_att: 1
+  use_l2wrap: 0
+  use_tokenshift_att: 0
   use_tokenshift_ffn: 1
 
 train:
   warmup_iters: 10
   warmdown_type: cos
-  data_packing: 1
-  train_dataset: "data/minipile_rwkv/minipile_rwkv_train_*.bin"
-  val_dataset: "data/minipile_rwkv/minipile_rwkv_val_*.bin"
-  device_batch_size: 64
-  sequence_length: 1024
-  num_iterations: 12000
-  warmdown_iters: 12000
+  data_packing: 0 #1
+  train_dataset: 'robbiegwaldd/dclm-10B' #"data/fineweb10B/fineweb_train_*.bin"
+  val_dataset: 'robbiegwaldd/dclm-10B' #"data/fineweb10B/fineweb_val_*.bin"
+  device_batch_size: 16 #64
+  sequence_length: 4096 #1024
+  num_iterations: 3000
+  warmdown_iters: 3000
   warmdown_min_ratio: 0.1
   weight_decay: 0.001
-  wandb: Test2
+  wandb: speedtrain_adam
   opts:
     'matrix_params': 
       opt: 'adam'

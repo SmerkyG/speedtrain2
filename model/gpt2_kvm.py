@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from utils.defer import defer
 
+from utils.init import orthogonal_
 from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 from torch.nn.attention.flex_attention import create_block_mask
 
@@ -116,7 +117,7 @@ class CausalSelfAttention(nn.Module):
         BSWA_NUM_CHUNKS = self.n_bswa_chunks
         self.block_mask = create_block_mask(mask_mod=bswa_mask_mod, B=None, H=None, Q_LEN=config.sequence_length, KV_LEN=config.sequence_length)
 
-        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
         self.rope_zeroing = True
 
@@ -304,30 +305,27 @@ class MLP(nn.Module):
     def __init__(self, config, layer_id):
         super().__init__()
         self.config = config
-
-        C = config.d_embed
-
-        with torch.no_grad():
-            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
-            ddd = torch.ones(C)
-            for i in range(C):
-                ddd[i] = i / C
-                
-        if config.use_tokenshift_ffn:
-            self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
-
-        self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, 4 * config.d_embed, bias=False))
-        #nn.init.orthogonal_(self.c_fc.weight, gain=1)
-        self.c_proj  = set_label('matrix_params', nn.Linear(4 * config.d_embed, config.d_embed, bias=False))
+        d_hidden = int(config.ffn_expansion * config.d_embed)//32*32
+        self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, d_hidden, bias=False))
+        orthogonal_(self.c_fc.weight, gain=1)
+        self.c_proj  = set_label('matrix_params', nn.Linear(d_hidden, config.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
-        self.ln_x = set_label('scalars2', nn.LayerNorm(config.d_embed))
+
+        if config.use_tokenshift_ffn:
+            with torch.no_grad():
+                ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+                ddd = torch.ones(1, 1, config.d_embed)
+                for i in range(config.d_embed):
+                    ddd[0, 0, i] = i / config.d_embed
+                self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
+
+        self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
     @defer(torch.compile)
-    def forward(self, residual, x, token_ids):
-        B,T,C = x.shape
+    def forward(self, residual, x, **kwargs):
         dx_prev = F.pad(x, [0,0,1,-1]) - x
         if self.config.use_tokenshift_ffn:
-            xk = x + dx_prev * self.x_k.view(1, 1, C)
+            xk = x + dx_prev * self.x_k
         else:
             xk = x
         x = self.c_fc(xk)
@@ -348,8 +346,8 @@ class Block(nn.Module):
     def forward(self, x, v1, x0, dx0, token_ids):
         if self.config.use_block_lambdas:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = self.attn(x, self.attn.ln_x(x), v1, x0, dx0, token_ids)
-        x = self.mlp(x, self.mlp.ln_x(x), token_ids)
+        x = self.attn(x, self.attn.ln_res(x), v1, x0, dx0, token_ids)
+        x = self.mlp(x, self.mlp.ln_res(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -365,9 +363,7 @@ class GPT(nn.Module):
             wte = set_label('wte_embed', nn.Embedding(config.vocab_size, config.d_embed)),
             h = nn.ModuleList([Block(config, layer_id) for layer_id in range(config.n_layer)]),
         ))
-
-        # with torch.no_grad():
-        #     nn.init.uniform_(self.transformer.wte.weight, a=-1e-4, b=1e-4)
+        nn.init.uniform_(self.transformer.wte.weight, a=-1e-4, b=1e-4)
 
         if self.config.use_skip_connections:
             # U-net design by @brendanh0gan
@@ -380,9 +376,8 @@ class GPT(nn.Module):
             self.decoder_layers = 0
 
         self.lm_head = set_label('lm_head', nn.Linear(config.d_embed, config.vocab_size, bias=False))
-        self.lm_head.weight.data.zero_() # @Grad62304977
-        # with torch.no_grad():
-        #     nn.init.orthogonal_(self.lm_head.weight, gain=0.5 * (config.vocab_size / config.d_embed)**0.5)
+        #self.lm_head.weight.data.zero_() # @Grad62304977
+        orthogonal_(self.lm_head.weight, gain=0.5 * (config.vocab_size / config.d_embed)**0.5)
 
         self.ln_emb = set_label('scalars2', nn.LayerNorm(config.d_embed))
         self.ln_head = set_label('scalars2', nn.LayerNorm(config.d_embed))
@@ -401,7 +396,7 @@ class GPT(nn.Module):
         x0 = x
         v1 = None
         if self.config.use_value_residual:
-            v1 = self.transformer.h[0].attn.c_v(self.transformer.h[0].attn.ln_x(x0))
+            v1 = self.transformer.h[0].attn.c_v(self.transformer.h[0].attn.ln_res(x0))
 
         # Store outputs for U-Net skip connections
         skip_connections = []

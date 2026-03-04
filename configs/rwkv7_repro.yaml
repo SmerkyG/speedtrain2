@@ -1,5 +1,5 @@
 model:
-  model_class_path: model.rwkv7c.GPT
+  model_class_path: model.rwkv7.GPT
   vocab_size: 65536
   n_head: 12
   use_skip_connections: 0
@@ -15,7 +15,7 @@ train:
   data_packing: 1
   train_dataset: "data/minipile_rwkv/minipile_rwkv_train_*.bin"
   val_dataset: "data/minipile_rwkv/minipile_rwkv_val_*.bin"
-  device_batch_size: 64
+  device_batch_size: 16
   sequence_length: 1024
   num_iterations: 12000
   warmdown_iters: 12000
@@ -46,10 +46,5 @@ train:
     'scalars2': 
       opt: 'adam'
       lr: 0.0006
-      beta1: 0.9
-      beta2: 0.99
-    'scalars3': 
-      opt: 'adam'
-      lr: 0.0012
       beta1: 0.9
       beta2: 0.99

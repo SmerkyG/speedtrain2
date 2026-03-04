@@ -8,10 +8,25 @@ from utils.init import orthogonal_
 from utils.defer import defer
 from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 
+def ortho_init(x, scale):
+    with torch.no_grad():
+        shape = x.shape
+        if len(shape) == 2:
+            gain = (shape[0] / shape[1])**0.5 if shape[0] > shape[1] else 1
+            orthogonal_(x, gain=gain * scale)
+        elif len(shape) == 3:
+            gain = (shape[1] / shape[2])**0.5 if shape[1] > shape[2] else 1
+            for i in range(shape[0]):
+                orthogonal_(x[i], gain=gain * scale)
+        else:
+            assert False
+        return x
+    
 class RWKV7cTimeMix(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
+        self.config = config
         self.n_head = config.n_head
         self.d_embed = config.d_embed
         self.head_dim = self.d_embed // self.n_head
@@ -47,9 +62,10 @@ class RWKV7cTimeMix(nn.Module):
                 zigzag[n] = zigzag[n] * abs(zigzag[n])
                 www[n] = -6 + 6 * (n / (C - 1)) ** (1 + 1 * ratio_0_to_1 ** 0.3)
 
-        self.x_q = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0)))
-        self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
-        self.x_v = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
+        if config.use_tokenshift_att:
+            self.x_q = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0)))
+            self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
+            self.x_v = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
 
         self.v0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4))
 
@@ -65,10 +81,13 @@ class RWKV7cTimeMix(nn.Module):
     def forward(self, residual, x, x0, dx0, token_ids):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H = self.n_head
-        dx_prev = F.pad(x, [0,0,1,-1]) - x
-        xq = x + dx_prev * self.x_q
-        xk = x + dx_prev * self.x_k
-        xv = x + dx_prev * self.x_v
+        if self.config.use_tokenshift_att:
+            dx_prev = F.pad(x, [0,0,1,-1]) - x
+            xq = x + dx_prev * self.x_q
+            xk = x + dx_prev * self.x_k
+            xv = x + dx_prev * self.x_v
+        else:
+            xq, xk, xv = x, x, x
         q = self.c_q(xq)
         k = self.c_k(xk)
         v = self.c_v(xv)
@@ -110,25 +129,31 @@ class MLP(nn.Module):
 
     def __init__(self, config, layer_id):
         super().__init__()
-        self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, 4 * config.d_embed, bias=False))
+        self.config = config
+        d_hidden = int(config.ffn_expansion * config.d_embed)//32*32
+        self.c_fc    = set_label('matrix_params', nn.Linear(config.d_embed, d_hidden, bias=False))
         orthogonal_(self.c_fc.weight, gain=1)
-        self.c_proj  = set_label('matrix_params', nn.Linear(4 * config.d_embed, config.d_embed, bias=False))
+        self.c_proj  = set_label('matrix_params', nn.Linear(d_hidden, config.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
-        with torch.no_grad():
-            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
-            ddd = torch.ones(1, 1, config.d_embed)
-            for i in range(config.d_embed):
-                ddd[0, 0, i] = i / config.d_embed
-            self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
+        if config.use_tokenshift_ffn:
+            with torch.no_grad():
+                ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
+                ddd = torch.ones(1, 1, config.d_embed)
+                for i in range(config.d_embed):
+                    ddd[0, 0, i] = i / config.d_embed
+                self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, ratio_1_to_almost0**4)))
 
         self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
     @defer(torch.compile)
-    def forward(self, residual, x, token_ids):
+    def forward(self, residual, x, token_ids, **kwargs):
         dx_prev = F.pad(x, [0,0,1,-1]) - x
-        xk = x + dx_prev * self.x_k
-        x = self.c_fc(xk) #x = self.c_fc(x)
+        if self.config.use_tokenshift_ffn:
+            xk = x + dx_prev * self.x_k
+        else:
+            xk = x
+        x = self.c_fc(xk)
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return residual + x
@@ -175,7 +200,7 @@ class MLPDeepEmbed(nn.Module):
         self.ln_res = nn.LayerNorm(config.d_embed)
 
     @defer(torch.compile)
-    def forward(self, residual, x, token_ids):
+    def forward(self, residual, x, token_ids, **kwargs):
         B,T,C = x.shape
         dx_prev = F.pad(x, [0,0,1,-1]) - x
         xk = x + dx_prev * self.x_k
@@ -314,7 +339,8 @@ class GPT(nn.Module):
             logits = self.config.logit_softcap * torch.tanh(logits / self.config.logit_softcap) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
-        loss = L2Wrap.apply(loss, logits)
+        if self.config.use_l2wrap:
+            loss = L2Wrap.apply(loss, logits)
         loss = loss.float()
 
         acc = None

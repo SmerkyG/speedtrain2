@@ -282,12 +282,14 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     d_embed : int = 768
+    ffn_expansion : float = 4
 
     use_value_residual : int = 1
     use_tokenshift_att : int = 0
     use_tokenshift_ffn : int = 0
 
     logit_softcap : float = 30.0
+    use_l2wrap : int = 0
 
     rope_theta : float = 10_000.0
     rope_partial_dim : int = 64 # 0
@@ -514,6 +516,11 @@ x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mas
 # enable_mem_efficient_sdp(False)
 # enable_math_sdp(False)
 
+if master_process:
+    t0 = time.time()
+    print("Initializing optimizers... ", end='')
+
+
 # init the optimizer(s)
 
 
@@ -610,8 +617,14 @@ def get_lr_ratio(it):
     return args.warmdown_min_ratio + (1.0 - args.warmdown_min_ratio) * _get_lr_ratio(it)
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr_ratio) for opt in optimizers]
 
+if master_process:
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
+
 # begin logging
 if master_process:
+    t0 = time.time()
+    print("Beginning log... ", end='')
+
     run_id = str(uuid.uuid4())
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
@@ -636,6 +649,8 @@ if master_process:
         f.write("Config")
         f.write(str(cli_config))
         f.write('='*100 + '\n')
+
+    print(f"Done. {int(1000 * (time.time() - t0))}ms")
 
 if args.trainer == 'lightning':
     import lightning
@@ -829,7 +844,7 @@ if args.trainer == 'lightning':
 if len(args.wandb) > 0:
     if master_process:
         t0 = time.time()
-        print("Running test batch before logging in to wandb to force compile... ", end='')
+        print("Running test batch before logging in to wandb to force compile... ")
     # run a test batch before logging in to wandb
     #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
     loss = model(x, y, return_acc=False)['loss']
@@ -843,6 +858,7 @@ wandb_instance = None
 if master_process:    
     if len(args.wandb) > 0:
 
+        t0 = time.time()
         print("Login to wandb...")
         import wandb
         import datetime
@@ -855,6 +871,8 @@ if master_process:
             save_code=False,
         )
         wandb_instance = wandb
+
+        print(f"Done. {int(1000 * (time.time() - t0))}ms")
 
 dist.barrier() # make everyone wait so we don't get cray cray
 
