@@ -1,5 +1,5 @@
 model:
-  model_class_path: model.gpt2_kvm.GPT
+  model_class_path: model.gptalpha_kvm.GPT
   vocab_size: 50304
   n_head: 6
   use_skip_connections: 0
