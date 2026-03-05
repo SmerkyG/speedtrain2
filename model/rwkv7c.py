@@ -4,24 +4,10 @@ import torch.nn.functional as F
 
 from fla.ops.rwkv7.chunk import chunk_rwkv7
 
-from utils.init import orthogonal_
+from utils.init import orthogonal_, ortho_init
 from utils.defer import defer
 from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
-
-def ortho_init(x, scale):
-    with torch.no_grad():
-        shape = x.shape
-        if len(shape) == 2:
-            gain = (shape[0] / shape[1])**0.5 if shape[0] > shape[1] else 1
-            orthogonal_(x, gain=gain * scale)
-        elif len(shape) == 3:
-            gain = (shape[1] / shape[2])**0.5 if shape[1] > shape[2] else 1
-            for i in range(shape[0]):
-                orthogonal_(x[i], gain=gain * scale)
-        else:
-            assert False
-        return x
-    
+   
 class RWKV7cTimeMix(nn.Module):
 
     def __init__(self, config, layer_id):

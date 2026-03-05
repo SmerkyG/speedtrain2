@@ -91,9 +91,9 @@ class CausalSelfAttention(nn.Module):
                 ddd[i] = i / C
 
         if config.use_tokenshift_att:
-            self.x_q = set_label('matrix_params', nn.Parameter(0.5 * torch.ones(self.n_head, self.head_dim)))
-            self.x_k = set_label('matrix_params', nn.Parameter(0.5 * torch.ones(self.n_head, self.head_dim)))
-            self.x_v = set_label('matrix_params', nn.Parameter(0.5 * torch.ones(self.n_head, self.head_dim)))
+            self.x_q = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0)))
+            self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
+            self.x_v = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
 
         self.c_q = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_k = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
@@ -223,17 +223,16 @@ class CausalSelfAttention(nn.Module):
         N = self.head_dim
         # if self.config.use_tokenshift_att:
         #     if self.use_dkys:
-        #         dx_prev = torch.cat([x[:,0:1], x[:,0:-1]], dim=1) - x
+        #         xx = torch.cat([x[:,0:1],x[:,0:-1]], dim=-2) - x
         #     else:
-        #         dx_prev = F.pad(x, [0,0,1,-1]) - x
-        #     xq = x + dx_prev * self.x_q.view(1, 1, C)
-        #     xk = x + dx_prev * self.x_k.view(1, 1, C)
-        #     xv = x + dx_prev * self.x_v.view(1, 1, C)
+        #         xx = F.pad(x, [0,0,1,-1]) - x
+        #     xq = x + xx * self.x_q
+        #     xk = x + xx * self.x_k
+        #     xv = x + xx * self.x_v
         # else:
         xq, xk, xv = x, x, x
         q = self.c_q(xq)#.view(B, T, self.n_head, self.head_dim)
         k = self.c_k(xk)#.view(B, T, self.n_head, self.head_dim)
-        #xv = xv + self.v_emb(token_ids)
         v = self.c_v(xv)#.view(B, T, self.n_head, self.head_dim)
         if self.config.use_value_residual:
             v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
@@ -241,9 +240,6 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim)
         k = k.view(B, T, self.n_head, self.head_dim)
         v = v.view(B, T, self.n_head, self.head_dim)
-
-        q = self.ln_q(q)
-        k = self.ln_k(k)
 
         if self.config.use_tokenshift_att:
             if self.use_dkys:
@@ -254,6 +250,9 @@ class CausalSelfAttention(nn.Module):
                 q = q + self.x_q.view(1, 1, H, N) * (F.pad(q, [0,0,1,-1]) - q)
                 k = k + self.x_k.view(1, 1, H, N) * (F.pad(k, [0,0,1,-1]) - k)
                 v = v + self.x_v.view(1, 1, H, N) * (F.pad(v, [0,0,1,-1]) - v)
+
+        q = self.ln_q(q)
+        k = self.ln_k(k)
 
         if self.use_rope:
             q, k = self.rotary(q), self.rotary(k)
