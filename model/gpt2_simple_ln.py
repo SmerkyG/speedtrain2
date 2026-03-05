@@ -48,6 +48,8 @@ class CausalSelfAttention(nn.Module):
         self.c_q = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_k = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_v = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
+        self.ln_q = set_label('scalars2', nn.LayerNorm(self.head_dim))
+        self.ln_k = set_label('scalars2', nn.LayerNorm(self.head_dim))
         # output projection
         self.c_proj = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -86,6 +88,7 @@ class CausalSelfAttention(nn.Module):
     @defer(torch.compile)
     def forward(self, residual, x, v1, x0, dx0):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
+        H, N = self.n_head, self.head_dim
 
         if self.config.use_tokenshift_att:
             xx = F.pad(x, [0,0,1,-1]) - x
@@ -104,7 +107,8 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim)
         v = v.view(B, T, self.n_head, self.head_dim)
 
-        q, k = rms_norm(q), rms_norm(k) # QK norm suggested by @Grad62304977
+        q = self.ln_q(q)
+        k = self.ln_k(k)
 
         q, k = self.rotary(q), self.rotary(k)
 

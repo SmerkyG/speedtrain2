@@ -98,6 +98,9 @@ class CausalSelfAttention(nn.Module):
         self.c_q = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_k = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_v = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
+        self.ln_q = set_label('scalars2', nn.LayerNorm(self.head_dim))
+        self.ln_k = set_label('scalars2', nn.LayerNorm(self.head_dim))
+        self.ln_d_k = set_label('scalars2', nn.LayerNorm(self.head_dim))
         # output projection
         self.c_proj = set_label('matrix_params', nn.Linear(self.d_embed, self.d_embed, bias=False))
         self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
@@ -129,7 +132,12 @@ class CausalSelfAttention(nn.Module):
         self.use_dkys = True
         self.use_dfys = True
 
+        self.use_key_weighting = True
+
         self.final_norm = False
+
+        if self.use_key_weighting:
+            self.key_weighting = set_label('matrix_params', nn.Linear(config.d_embed, self.n_head, bias=False))
 
         if self.use_fox:
             self.decay_w = set_label('matrix_params', nn.Linear(config.d_embed, self.n_head, bias=False))
@@ -142,7 +150,7 @@ class CausalSelfAttention(nn.Module):
 
 
     @defer(torch.compile)
-    def inner_loop_attstate(self, e, q, k, v, d_k, d_v, d_vlen, log_f, causal_mask):
+    def inner_loop_attstate(self, e, q, k, v, d_k, d_v, d_vlen, log_f, key_weighting, causal_mask):
         chunk_len = self.chunk_len
         sink_len = self.sink_len
 
@@ -174,8 +182,8 @@ class CausalSelfAttention(nn.Module):
 
         attn_mask = causal_mask
 
-        d_k_norm = rms_norm(d_k) * state_head_temp
-        k_star = torch.cat([d_k_norm, bswa_k], dim=-2)
+        d_k_norm = self.ln_d_k(d_k)
+        k_star = torch.cat([d_k_norm * state_head_temp, bswa_k * front_head_temp], dim=-2)
         v_star = torch.cat([(F.normalize(d_v.float(), dim=-1) * d_vlen).bfloat16(), bswa_v], dim=-2)
         if self.use_fox:
             d_log_f = torch.zeros_like(log_f[:,:,:chunk_len])
@@ -185,13 +193,18 @@ class CausalSelfAttention(nn.Module):
             out = F.scaled_dot_product_attention(q_current, k_star, v_star, attn_mask=attn_mask, is_causal=False)
 
         if self.use_rope and self.rope_zeroing:
-            c_k_0 = rms_norm(torch.cat([torch.zeros_like(c_k[...,:self.rope_partial_dim]), c_k[...,self.rope_partial_dim:]], dim=-1)) * front_head_temp
+            c_k_0 = self.ln_d_k(torch.cat([torch.zeros_like(c_k[...,:self.rope_partial_dim]), c_k[...,self.rope_partial_dim:]], dim=-1))
         else:
-            c_k_0 = c_k # for no rope-zeroing
+            c_k_0 = self.ln_d_k(c_k) # for no rope-zeroing
         sim = torch.matmul(c_k_0, d_k_norm.transpose(-1, -2)) # [B, H, C_T, D_T]
         sim[...,0:sink_len] = float('-inf')
 
         use_dense = True
+
+        if key_weighting is not None:
+            key_weighting_current = key_weighting[:,:,bswa_begin:bswa_begin+chunk_len]
+            c_k_0 = c_k_0 * key_weighting_current
+            c_v = c_v * key_weighting_current
 
         best_sim, best_d_idx = sim.max(dim=-1, keepdim=True)  # [B, H, C_T, 1]
         if use_dense:
@@ -229,7 +242,8 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_dim)
         v = v.view(B, T, self.n_head, self.head_dim)
 
-        q, k = rms_norm(q), rms_norm(k) # QK norm suggested by @Grad62304977
+        q = self.ln_q(q)
+        k = self.ln_k(k)
 
         if self.config.use_tokenshift_att:
             if self.use_dkys:
@@ -244,6 +258,10 @@ class CausalSelfAttention(nn.Module):
         if self.use_rope:
             q, k = self.rotary(q), self.rotary(k)
 
+        if self.use_key_weighting:
+            key_weighting = 1.0 + F.elu(self.key_weighting(x).view(B, T, H, 1)).transpose(1, 2)
+        else:
+            key_weighting = None
 
         if self.use_fox:
             log_f = F.logsigmoid(self.decay_w(x).view(B, T, H).float())
@@ -258,12 +276,6 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        if self.use_head_temp:
-            front_head_temp = self.front_head_temp.view(1, H, 1, 1)
-            k = k * front_head_temp
-        else:
-            front_head_temp = 1
-
         # code for sdpa-only
         if self.attn_type == 'sdpa':
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -271,9 +283,9 @@ class CausalSelfAttention(nn.Module):
             chunk_len = self.chunk_len
 
             if self.rope_zeroing:
-                d_k = rms_norm(torch.cat([torch.zeros_like(k[...,:chunk_len,:self.rope_partial_dim]), k[...,:chunk_len,self.rope_partial_dim:]], dim=-1)) * front_head_temp
+                d_k = self.ln_d_k(torch.cat([torch.zeros_like(k[...,:chunk_len,:self.rope_partial_dim]), k[...,:chunk_len,self.rope_partial_dim:]], dim=-1))
             else:
-                d_k = k[:,:,:chunk_len,:]
+                d_k = self.ln_d_k(k[:,:,:chunk_len,:])
             d_v = v[:,:,:chunk_len,:]
 
             d_vlen = torch.norm(d_v.float(), dim=-1, keepdim=True)
@@ -287,7 +299,7 @@ class CausalSelfAttention(nn.Module):
             causal_mask = _lower_right_causal_mask(chunk_len, bswa_len + max_d_len, device=q.device)
 
             for e in range(max_d_len + bswa_len, T+1, chunk_len):
-                d_k, d_v, out = self.inner_loop_attstate(e, q, k, v, d_k, d_v, d_vlen, log_f, causal_mask)
+                d_k, d_v, out = self.inner_loop_attstate(e, q, k, v, d_k, d_v, d_vlen, log_f, key_weighting, causal_mask)
                 outs.append(out)
 
             y = torch.cat(outs, dim=-2)
