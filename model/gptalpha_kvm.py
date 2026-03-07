@@ -290,10 +290,14 @@ class CausalSelfAttention(nn.Module):
             d_vlen = torch.norm(d_v.float(), dim=-1, keepdim=True)
             bswa_len = self.n_bswa_chunks * chunk_len
             max_d_len = self.n_max_d_chunks * chunk_len
-            if self.use_fox:
-                outs = [forgetting_attention_sdpa(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], log_f=log_f[:,:,0:bswa_len], use_dfys=self.use_dfys)]
+            if self.use_head_temp:
+                front_head_temp = self.front_head_temp.view(1, H, 1, 1)
             else:
-                outs = [F.scaled_dot_product_attention(q[:,:,0:bswa_len], k[:,:,0:bswa_len], v[:,:,0:bswa_len], is_causal=True)]
+                front_head_temp = 1
+            if self.use_fox:
+                outs = [forgetting_attention_sdpa(q[:,:,0:bswa_len], k[:,:,0:bswa_len] * front_head_temp, v[:,:,0:bswa_len], log_f=log_f[:,:,0:bswa_len], use_dfys=self.use_dfys)]
+            else:
+                outs = [F.scaled_dot_product_attention(q[:,:,0:bswa_len], k[:,:,0:bswa_len] * front_head_temp, v[:,:,0:bswa_len], is_causal=True)]
 
             causal_mask = _lower_right_causal_mask(chunk_len, bswa_len + max_d_len, device=q.device)
 
