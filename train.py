@@ -259,7 +259,6 @@ class Hyperparameters:
         'lm_head': dict(opt='adam', lr=0.008, beta1=0.9, beta2=0.95),
         'scalars': dict(opt='adam', lr=0.04, beta1=0.9, beta2=0.95),
         'scalars2': dict(opt='adam', lr=0.0006, beta1=0.9, beta2=0.95),
-        'scalars3': dict(opt='adam', lr=0.0012, beta1=0.9, beta2=0.95),
         'scalars3': dict(opt='adam', lr=0.002, beta1=0.9, beta2=0.95),
     })
     weight_decay : float = 0
@@ -379,9 +378,10 @@ if master_process:
     t0 = time.time()
     print("Reloading model class with torch.compile allowed... ", end='')
 
-# apply torch.compile to model where deferred
-from utils.defer import apply_deferred
-apply_deferred(model)
+if args.compile > 0:
+	# apply torch.compile to model where deferred
+	from utils.defer import apply_deferred
+	apply_deferred(model)
 
 if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
@@ -500,12 +500,12 @@ if master_process:
 
 train_loader = iter(train_data_loader)
 
-datum = next(train_loader)
+next_datum = next(train_loader)
+x, y, attention_mask = next_datum['input_ids'], next_datum['labels'], next_datum['attention_mask']
 
 if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
 
-x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mask']
 
 
 
@@ -522,7 +522,10 @@ if master_process:
 
 
 # init the optimizer(s)
-
+if master_process:
+    print("\nOPTS")
+    print(args.opts)
+    print()
 
 named_param_sets = {n:[] for n in args.opts.keys()}
 for n, p in raw_model.named_parameters():
@@ -959,20 +962,18 @@ for step in range(args.num_iterations + 1):
         #loss = model_graph_callable(x, y)
         #train_loss = static_loss.detach()
 
+        datum = next_datum
+        x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mask']
+        # advance the dataset for the next batch
+        try:
+            next_datum = next(train_loader)
+        except StopIteration:
+            last_step = True
+
         # forward pass
         #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         loss = model(x, y, return_acc=False)['loss']
-        train_loss = loss.detach()
 
-        # advance the dataset for the next batch
-        try:
-            datum = next(train_loader)
-        except StopIteration:
-            if master_process:
-                print("Reached end of dataset. Stopping early.")
-            last_step = True
-            break
-        x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mask']
         # backward pass
         if i < train_accumulation_steps:
             with model.no_sync(): # there's no need to sync gradients every accumulation step
@@ -982,8 +983,14 @@ for step in range(args.num_iterations + 1):
 
         real_tokens += args.batch_size * args.sequence_length
 
+        if last_step:
+            if master_process:
+                print("Reached end of dataset. Stopping early.")
+            break
+
     if not last_step:
-    
+        train_loss = loss.detach()
+
         if train_accumulation_steps > 1:
             for p in model.parameters():
                 if p.grad is not None:
