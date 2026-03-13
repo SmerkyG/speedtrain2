@@ -270,7 +270,7 @@ class Hyperparameters:
     grad_cp : int = 0
     compile : int = 1
     wandb : str = 'speedtrain'
-    strategy : str = 'ddp_find_unused_parameters'
+    strategy : str = 'ddp' # or 'ddp_find_unused_parameters'
 
 
 @dataclass(kw_only=True)
