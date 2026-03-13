@@ -507,15 +507,6 @@ if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
 
 
-
-
-# CUDNN attention is ~4ms faster than Flash, but doesn't get selected by default in PyTorch 2.5.1
-# from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-# enable_cudnn_sdp(True)
-# enable_flash_sdp(False)
-# enable_mem_efficient_sdp(False)
-# enable_math_sdp(False)
-
 if master_process:
     t0 = time.time()
     print("Initializing optimizers... ", end='')
@@ -536,55 +527,6 @@ for n, p in raw_model.named_parameters():
 
 param_sets = list(named_param_sets.values())
 opt_arg_sets = list(args.opts.values())
-
-# from torch.optim import Optimizer
-
-# class MasterWeightOptimizer(Optimizer):
-#     def __init__(self, optimizer_cls, model_params, **optimizer_kwargs):
-#         self.model_params = list(model_params)
-#         self.master_params = [p.detach().float().requires_grad_(True) 
-#                               for p in model_params]
-#         self.optimizer = optimizer_cls(self.master_params, **optimizer_kwargs)
-
-#     @property
-#     def param_groups(self):
-#         return self.optimizer.param_groups
-
-#     @property
-#     def state(self):
-#         return self.optimizer.state
-
-#     def state_dict(self):
-#         return self.optimizer.state_dict()
-
-#     def load_state_dict(self, state_dict):
-#         self.optimizer.load_state_dict(state_dict)
-
-#     def step(self):
-#         # Copy bf16 grads -> fp32 master grads.
-#         for p, mp in zip(self.model_params, self.master_params):
-#             if p.grad is not None:
-#                 if mp.grad is None:
-#                     mp.grad = p.grad.float()
-#                 else:
-#                     mp.grad.copy_(p.grad)
-
-#         self.optimizer.step()
-        
-#         # Copy fp32 master weights -> bf16 model.
-#         with torch.no_grad():
-#             for p, mp in zip(self.model_params, self.master_params):
-#                 p.copy_(mp)
-
-#     def zero_grad(self, set_to_none = True):
-#         self.optimizer.zero_grad(set_to_none=set_to_none)
-#         if set_to_none:
-#             for p in self.model_params:
-#                 p.grad = None
-#         else:
-#             for p in self.model_params:
-#                 p.grad.zero_()
-
 
 master_param_sets = [[p.detach().clone().float() for p in model_params] for model_params in param_sets]
 optimizers = []
