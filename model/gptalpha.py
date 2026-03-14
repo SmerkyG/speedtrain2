@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from utils.init import orthogonal_
+from utils.init import orthogonal_, ortho_init
 from utils.defer import defer
 from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 
@@ -56,7 +56,7 @@ class CausalSelfAttention(nn.Module):
         self.rope_partial_dim = config.rope_partial_dim if config.rope_partial_dim > 0 else self.head_dim
         self.rotary = Rotary(self.head_dim, self.rope_partial_dim, base=config.rope_theta, seq_len=config.sequence_length)
 
-        self.block_mask = create_block_mask(mask_mod=causal_mask_mod, B=None, H=None, Q_LEN=config.sequence_length, KV_LEN=config.sequence_length)
+        #self.block_mask = create_block_mask(mask_mod=causal_mask_mod, B=None, H=None, Q_LEN=config.sequence_length, KV_LEN=config.sequence_length)
 
         self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
@@ -87,8 +87,16 @@ class CausalSelfAttention(nn.Module):
             self.x_k = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
             self.x_v = set_label('scalars2', nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0)))
 
+        if config.use_value_residual:
+            #self.lamb = set_label('scalars', nn.Parameter(torch.tensor(0.5))) # @Grad62304977
+            # D_MV_LORA = 32
+            D_MV_LORA = max(32, int(round(  (1.3*(C**0.5))  /32)*32)) # suggestion
+            self.v1 = set_label('matrix_params', nn.Parameter(torch.zeros(C, D_MV_LORA)))
+            self.v2 = set_label('matrix_params', nn.Parameter(ortho_init(torch.empty(D_MV_LORA, C), 0.1)))
+            self.v0 = set_label('scalars2', nn.Parameter(torch.zeros(1,1,C)+0.73 - linear*0.4))
+
     @defer(torch.compile)
-    def forward(self, residual, x, v1, x0, dx0):
+    def forward(self, residual, x, v1, x0, dx0, block_mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H, N = self.n_head, self.head_dim
 
@@ -106,6 +114,9 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(xq)
         k = self.c_k(xk)
         v = self.c_v(xv)
+        if self.config.use_value_residual:
+            #v = (1 - self.lamb) * v + self.lamb * v1.view_as(v) # @Grad62304977
+            v = v + (v1.view_as(v) - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2) # add value residual
 
         q = q.view(B, T, self.n_head, self.head_dim)
         k = k.view(B, T, self.n_head, self.head_dim)
@@ -126,8 +137,8 @@ class CausalSelfAttention(nn.Module):
 
         q, k = self.rotary(q), self.rotary(k)
 
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
-        #y = separately_compiled_flex_attention(query=q.transpose(1, 2), key=k.transpose(1, 2), value=v.transpose(1, 2), block_mask=self.block_mask, enable_gqa=False)
+        #y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = separately_compiled_flex_attention(query=q.transpose(1, 2), key=k.transpose(1, 2), value=v.transpose(1, 2), block_mask=block_mask, enable_gqa=False)
 
         y = y.transpose(1, 2).contiguous().view_as(residual) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -174,8 +185,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_id)
         self.mlp = MLP(config, layer_id)
     
-    def forward(self, x, v1, x0, dx0):
-        x = self.attn(x, self.attn.ln_res(x), v1, x0, dx0)
+    def forward(self, x, v1, x0, dx0, block_mask):
+        x = self.attn(x, self.attn.ln_res(x), v1, x0, dx0, block_mask)
         x = self.mlp(x, self.mlp.ln_res(x))
         return x
 
@@ -210,15 +221,42 @@ class GPT(nn.Module):
         dx0 = F.pad(x, [0,0,1,-1]) - x
         return x, dx0
 
-    def forward(self, idx, target, return_acc=False):
+    def forward(self, idx, target, cu_seqlens=None, return_acc=False):
         # forward the GPT model itself
         x, dx0 = self.embed(idx)
         x0 = x
         v1 = self.transformer.h[0].attn.c_v(x0)
 
+        #block_mask = create_block_mask(mask_mod=causal_mask_mod, B=None, H=None, Q_LEN=config.sequence_length, KV_LEN=config.sequence_length)
+
+        if cu_seqlens is not None:
+            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=x.device)
+
+            # 1. Calculate lengths of each document
+            doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1] 
+            # doc_lengths -> [3, 2, 4]
+
+            # 2. Generate document IDs (0, 1, 2) and repeat them by their length
+            doc_ids_range = torch.arange(len(doc_lengths), device=cu_seqlens.device)
+            doc_ids = torch.repeat_interleave(doc_ids_range, doc_lengths)
+            #doc_ids.copy_(torch.repeat_interleave(doc_ids_range, doc_lengths))
+
+            def doc_mask_mod(b, h, q_idx, kv_idx):
+                causal_mask = q_idx >= kv_idx
+                document_mask = doc_ids[q_idx] == doc_ids[kv_idx]
+                return document_mask & causal_mask
+            
+            B,T,C = x.shape
+
+            mask_mod = doc_mask_mod
+        else:
+            mask_mod = causal_mask_mod
+
+        block_mask = create_block_mask(mask_mod=mask_mod, B=None, H=None, Q_LEN=T, KV_LEN=T)
+
         # Encoder pass - process only the first half of the blocks
         for i in range(self.config.n_layer):
-            x = self.transformer.h[i](x, v1, x0, dx0)
+            x = self.transformer.h[i](x, v1, x0, dx0, block_mask)
 
         return self.unembed(x, target, return_acc)
 

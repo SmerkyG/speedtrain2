@@ -13,11 +13,14 @@ model:
 train:
   warmup_iters: 50
   warmdown_type: cos
-  data_packing: 0 #1
   train_dataset: 'robbiegwaldd/dclm-10B' #"data/fineweb10B/fineweb_train_*.bin"
   val_dataset: 'robbiegwaldd/dclm-10B' #"data/fineweb10B/fineweb_val_*.bin"
-  device_batch_size: 16 #64
-  sequence_length: 4096 #1024
+  data_packing: 'varlen'
+  device_batch_size: 1
+  sequence_length: 65536
+  max_document_length: 4096
+  val_device_batch_size: 1
+  #val_sequence_length: 4096
   num_iterations: 3000
   warmdown_iters: 3000
   warmdown_min_ratio: 0.1

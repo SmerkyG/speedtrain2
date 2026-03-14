@@ -23,6 +23,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 import torch.distributed as dist
 
+from typing import List, Dict, Union
+
 if dist.is_available() and dist.is_initialized():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 else:
@@ -239,13 +241,14 @@ class DistributedDataLoader:
 class Hyperparameters:
     trainer : str = 'default'
     # data hyperparams
-    data_packing : int = 0
+    data_packing : str = 'pad' # 'pack' | 'pad' | 'varlen'
     train_dataset : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on #'data/minipile/minipile_train_*.bin' 
     train_dataset_name : str|None = None # 'sample-10BT'
     val_dataset : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = -1 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
+    max_document_length : int = 9999999 # docs are croped to this length, in tokens
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 3000 # number of iterations to run
     warmup_iters : int = 0
@@ -265,12 +268,14 @@ class Hyperparameters:
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    #val_sequence_length : int = 1024
     val_device_batch_size : int = 64
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     grad_cp : int = 0
     compile : int = 1
     wandb : str = 'speedtrain'
     strategy : str = 'ddp' # or 'ddp_find_unused_parameters'
+    seed : int | None = None
 
 
 @dataclass(kw_only=True)
@@ -297,6 +302,8 @@ class GPTConfig:
     use_block_lambdas : int = 1
 
     sequence_length : int = -1 # just a placeholder so we don't need to pass args
+
+    tokenizer : str = 'gpt2'
 
 
 @dataclass(kw_only=True)
@@ -341,6 +348,9 @@ args.batch_size = ddp_world_size * args.device_batch_size
 model_config = cli_config.model
 model_config.sequence_length = args.sequence_length
 
+if args.seed is not None:
+    torch.manual_seed(args.seed)
+
 import utils.grad_cp
 utils.grad_cp.use_grad_cp = bool(args.grad_cp)
 
@@ -369,7 +379,7 @@ if master_process:
 if master_process:
     t0 = time.time()
     print("Testing model... ", end='')
-loss = model(torch.zeros([1,args.sequence_length], dtype=torch.long), torch.zeros([1,args.sequence_length], dtype=torch.long))['loss']
+loss = model(torch.zeros([1,args.sequence_length], dtype=torch.long), torch.zeros([1,args.sequence_length], dtype=torch.long), [0,args.sequence_length])['loss']
 loss.backward()
 if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
@@ -421,20 +431,119 @@ if master_process:
     print("Loading datasets... ")
 
 # load tokens
-if args.data_packing:
+assert args.data_packing in ['varlen', 'pack', 'pad']
+if args.data_packing == 'varlen':
+    from transformers import AutoTokenizer, PreTrainedTokenizer
+    from copy import deepcopy
+
+    from torch.utils.data import IterableDataset, DataLoader
+    from collections import deque
+    from datasets import load_dataset, Dataset
+    from torch.utils.data.distributed import DistributedSampler
+
+    class ContextPackedDataset(IterableDataset):
+        def __init__(self, src_dataset, context_len, max_doc_length, tokenizer):
+            if ddp_world_size > 1:
+                src_dataset = src_dataset.shard(ddp_world_size, ddp_rank)
+            self.src_dataset = src_dataset
+            self.context_len = context_len + 1 # NOTE - this is so that collator can obtain properly size input_ids and labels
+            self.max_doc_length = max_doc_length
+            self.tokenizer = tokenizer
+
+        def __iter__(self):
+            while True:
+                src_iter = iter(self.src_dataset)
+                input_ids_buffer = deque()
+
+                # FIXME - actually we really need to attention_mask the tokens that are the end of each document, since they don't predict the first token of the next document
+                
+                try:
+                    while sum(len(s) for s in input_ids_buffer) < self.context_len:
+                        docs = []
+                        tokenization_batch_size = 128
+                        for _ in range(tokenization_batch_size):
+                            item = next(src_iter)
+                            doc = item.get('text') or item.get('content')
+                            if doc is None:
+                                raise ValueError(f"No 'text' or 'content' field found in sample:\n{item}")
+                            docs.append(doc)
+                        # FIXME - do we want to use self.max_doc_length+1?
+                        # FIXME - we need to add EOS and attend to those at document endings only, which I think this should handle properly but not 100% sure
+                        tokenized_batch = self.tokenizer(docs, truncation=True, max_length=self.max_doc_length, padding=False, return_attention_mask=True, add_special_tokens=True)
+                        input_ids_buffer.extend(tokenized_batch['input_ids'])
+                except StopIteration:
+                    break
+
+                combined = {'input_ids':[], 'attention_mask':[], 'cu_seqlens':[]}
+                cu_seqlen = 0
+                while len(combined['input_ids']) < self.context_len:
+                    input_ids = input_ids_buffer.popleft()
+                    combined['input_ids'] += input_ids
+                    combined['cu_seqlens'].append(cu_seqlen)
+                    cu_seqlen += len(input_ids)
+                combined['input_ids'] = combined['input_ids'][:self.context_len]
+                combined['cu_seqlens'].append(len(combined['input_ids'])-1) # NOTE - -1 is because of same context_len + 1 issue above, this could end up doubling up last cu so we need to fix that
+
+                yield combined
+
+    def collate_basic(batch):
+        # NOTE - currently this expects NO BATCH DIM
+        input_ids = torch.tensor(batch['input_ids']).unsqueeze(0)
+        batch['input_ids'] = input_ids[:,:-1]
+        batch['labels'] = input_ids[:,1:]
+        #cu_seqlens = batch['cu_seqlens']
+        #doc_lens = [batch['cu_seqlens'][i] - batch['cu_seqlens'][i-1] for i in range(1, len(batch['cu_seqlens']))]
+        #cu_seqlens = F.pad(torch.tensor(doc_lens, dtype=torch.int).cumsum(0).int(), (1, 0))
+        return batch # dict(input_ids=input_ids, labels=labels, cu_seqlens=cu_seqlens) #:q, cu_seqlens, int(lengths.max()), labels    
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer)    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    if not master_process:
+        torch.distributed.barrier()
+    dataset = load_dataset(args.train_dataset, name=args.train_dataset_name, split="train", streaming=False)
+    # NOTE - we could maybe allow the sampler to do the shuffling instead, but the 'select' should happen after shuffling and maybe having select helps processing speed??
+    train_dataset = dataset.shuffle(seed=42).select(range(args.num_iterations * B * ddp_world_size))
+    val_dataset = dataset.shuffle(seed=0) #.select(range(val_steps * args.val_device_batch_size * ddp_world_size))
+    if master_process:
+        torch.distributed.barrier()
+
+    train_dataset = ContextPackedDataset(train_dataset, context_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
+
+    val_dataset = ContextPackedDataset(val_dataset, context_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
+
+    torch.set_default_device(old_default_device)
+
+    train_data_loader = DataLoader(
+        train_dataset,
+        batch_size=None,
+        collate_fn=collate_basic,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    val_data_loader = DataLoader(
+        val_dataset,
+        batch_size=None,
+        collate_fn=collate_basic,
+        num_workers=4,
+        pin_memory=True,
+    )
+    
+elif args.data_packing == 'pack':
     train_data_loader = DistributedDataLoader(args.train_dataset, B, T, ddp_rank, ddp_world_size)
     val_data_loader = DistributedDataLoader(args.val_dataset, args.val_device_batch_size, T, ddp_rank, ddp_world_size)
     if master_process:
         print(f"Training DataLoader: total number of tokens: {train_data_loader.ntok_total} across {len(train_data_loader.files)} files")
         print(f"Validation DataLoader: total number of tokens: {val_data_loader.ntok_total} across {len(val_data_loader.files)} files")
-else:
+elif args.data_packing == 'pad':
 
     from datasets import load_dataset
     from torch.utils.data import DataLoader, Dataset
     from transformers import AutoTokenizer, DataCollatorWithPadding
     import torch
     from torch.utils.data.distributed import DistributedSampler
-    from typing import List, Dict, Union
 
     @dataclass
     class TruncatingTokenizingCollator:
@@ -443,7 +552,7 @@ else:
 
         def __call__(self, examples: List[Dict[str, Union[str, List[str]]]]) -> Dict[str, torch.Tensor]:
             texts = [example['text'] for example in examples]
-            tokens = self.tokenizer(texts, truncation=True, max_length=self.max_length+1, padding="max_length", return_tensors='pt')
+            tokens = self.tokenizer(texts, truncation=True, max_length=self.max_length+1, padding="max_length", return_attention_mask=True, return_tensors='pt')
             input_ids = tokens["input_ids"][:, :-1]
             attention_mask = tokens["attention_mask"][:, :-1]
             labels = tokens["input_ids"][:, 1:].clone()
@@ -454,7 +563,7 @@ else:
                 "labels": labels,
             }
 
-    tokenizer = AutoTokenizer.from_pretrained('gpt2')    
+    tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer)    
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -501,7 +610,7 @@ if master_process:
 train_loader = iter(train_data_loader)
 
 next_datum = next(train_loader)
-x, y, attention_mask = next_datum['input_ids'], next_datum['labels'], next_datum['attention_mask']
+x, y, cu_seqlens, attention_mask = next_datum['input_ids'], next_datum['labels'], next_datum.get('cu_seqlens'), next_datum.get('attention_mask')
 
 if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
@@ -603,7 +712,7 @@ if len(args.wandb) > 0:
         print("Running test batch before logging in to wandb to force compile... ")
     # run a test batch before logging in to wandb
     #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-    loss = model(x, y, return_acc=False)['loss']
+    loss = model(x, y, cu_seqlens, return_acc=False)['loss']
     with model.no_sync(): # there's no need to sync gradients every accumulation step
         loss.backward()    
     model.zero_grad(set_to_none=True)
@@ -665,9 +774,9 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 val_datum = next(val_loader)
-                x_val, y_val, attention_mask_val = val_datum['input_ids'], val_datum['labels'], val_datum['attention_mask']
+                x_val, y_val, cu_seqlens_val, attention_mask_val = val_datum['input_ids'], val_datum['labels'], val_datum.get('cu_seqlens'), val_datum.get('attention_mask')
                 #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                val_results = model(x_val, y_val, return_acc=True)
+                val_results = model(x_val, y_val, cu_seqlens, return_acc=True)
                 val_loss += val_results['loss']
                 val_acc += val_results['acc']
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -716,7 +825,7 @@ for step in range(args.num_iterations + 1):
         #train_loss = static_loss.detach()
 
         datum = next_datum
-        x, y, attention_mask = datum['input_ids'], datum['labels'], datum['attention_mask']
+        x, y, cu_seqlens, attention_mask = next_datum['input_ids'], next_datum['labels'], next_datum.get('cu_seqlens'), next_datum.get('attention_mask')
         # advance the dataset for the next batch
         try:
             next_datum = next(train_loader)
@@ -725,7 +834,7 @@ for step in range(args.num_iterations + 1):
 
         # forward pass
         #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        loss = model(x, y, return_acc=False)['loss']
+        loss = model(x, y, cu_seqlens, return_acc=False)['loss']
 
         # backward pass
         if i < train_accumulation_steps:
