@@ -23,7 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 import torch.distributed as dist
 
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Callable, Optional, Any
 
 if dist.is_available() and dist.is_initialized():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -379,7 +379,10 @@ if master_process:
 if master_process:
     t0 = time.time()
     print("Testing model... ", end='')
-loss = model(torch.zeros([1,args.sequence_length], dtype=torch.long), torch.zeros([1,args.sequence_length], dtype=torch.long), [0,args.sequence_length])['loss']
+cu_seqlens = None
+if args.data_packing == 'varlen':
+    cu_seqlens = [0,args.sequence_length]
+loss = model(torch.zeros([1,args.sequence_length], dtype=torch.long), torch.zeros([1,args.sequence_length], dtype=torch.long), cu_seqlens)['loss']
 loss.backward()
 if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
@@ -436,99 +439,192 @@ if args.data_packing == 'varlen':
     from transformers import AutoTokenizer, PreTrainedTokenizer
     from copy import deepcopy
 
-    from torch.utils.data import IterableDataset, DataLoader
+    from torch.utils.data import DataLoader, IterableDataset
     from collections import deque
     from datasets import load_dataset, Dataset
     from torch.utils.data.distributed import DistributedSampler
 
     class ContextPackedDataset(IterableDataset):
-        def __init__(self, src_dataset, context_len, max_doc_length, tokenizer):
-            if ddp_world_size > 1:
-                src_dataset = src_dataset.shard(ddp_world_size, ddp_rank)
+        def __init__(self, src_dataset, rank, world_size, sequence_len, max_doc_length, tokenizer, tokenization_batch_size=128):
             self.src_dataset = src_dataset
-            self.context_len = context_len + 1 # NOTE - this is so that collator can obtain properly size input_ids and labels
+            self.rank = rank
+            self.world_size = world_size
+            #self.sharded_dataset = LazyIterableDataset(src_dataset, rank, world_size)
+            self.sequence_len_plus_one = sequence_len + 1 # NOTE - this is so that collator can obtain properly size input_ids and labels
             self.max_doc_length = max_doc_length
             self.tokenizer = tokenizer
+            self.tokenization_batch_size = tokenization_batch_size
 
+            self.states = None
+            self.packed_tokens = []
+            self.cu_seqlens = []
+
+        def create_iterable_sharded_dataset(self):
+            worker_info = torch.utils.data.get_worker_info()
+            num_workers = worker_info.num_workers if worker_info is not None else 1
+            assert num_workers == 1, "somehow the num_workers is being limited to 1 when using this code, because the dataloader thinks we don't have enough shards, so we assert to make sure you don't use it incorrectly"
+            worker_id = worker_info.id if worker_info is not None else 0
+
+            # Global shard index = rank's offset + worker's local index
+            # Total shards must equal world_size * num_workers
+            global_shard_id = self.rank * num_workers + worker_id
+            total_shards = self.world_size * num_workers
+
+            iterable = self.src_dataset.to_iterable_dataset(num_shards=total_shards)
+            iterable = iterable.shard(num_shards=total_shards, index=global_shard_id)
+
+            return iterable
+
+        def emit(self, packed_tokens, cu_seqlens):
+            packed_tokens = packed_tokens[:self.sequence_len_plus_one]
+            cu_seqlens.append(self.sequence_len_plus_one - 1)
+
+            input_ids = torch.tensor(packed_tokens[:-1], dtype=torch.long)
+            labels = torch.tensor(packed_tokens[1:], dtype=torch.long)
+            # prevent label leakage across doc boundaries
+            for doc_start in cu_seqlens[1:]:
+                if doc_start <= self.sequence_len_plus_one - 1:
+                    labels[doc_start - 1] = -100
+
+            return dict(input_ids=input_ids.unsqueeze(0), labels=labels.unsqueeze(0), cu_seqlens=cu_seqlens)
+        
         def __iter__(self):
-            while True:
-                src_iter = iter(self.src_dataset)
-                input_ids_buffer = deque()
+            self.sharded_dataset = self.create_iterable_sharded_dataset()
 
-                # FIXME - actually we really need to attention_mask the tokens that are the end of each document, since they don't predict the first token of the next document
-                
+            if self.states is not None:
+               self.sharded_dataset.load_state_dict(self.states)
+
+            self.packed_tokens = []
+            self.cu_seqlens = []
+            for tokenized_doc in self.efficiently_tokenized():
+                self.cu_seqlens += [len(self.packed_tokens)]
+                self.packed_tokens += tokenized_doc
+
+                # usually skipped, this only emits a set of packed tokens if there are enough to fill the sequence length
+                while len(self.packed_tokens) >= self.sequence_len_plus_one:
+                    yield self.emit(self.packed_tokens, self.cu_seqlens)
+                    self.packed_tokens = []
+                    self.cu_seqlens = []
+
+            if master_process:
+                print("FINISHED DATASET")
+
+        def efficiently_tokenized(self):
+            batch, states = [], []
+            it = iter(self.sharded_dataset)
+            done = False
+            while not done:
                 try:
-                    while sum(len(s) for s in input_ids_buffer) < self.context_len:
-                        docs = []
-                        tokenization_batch_size = 128
-                        for _ in range(tokenization_batch_size):
-                            item = next(src_iter)
-                            doc = item.get('text') or item.get('content')
-                            if doc is None:
-                                raise ValueError(f"No 'text' or 'content' field found in sample:\n{item}")
-                            docs.append(doc)
-                        # FIXME - do we want to use self.max_doc_length+1?
-                        # FIXME - we need to add EOS and attend to those at document endings only, which I think this should handle properly but not 100% sure
-                        tokenized_batch = self.tokenizer(docs, truncation=True, max_length=self.max_doc_length, padding=False, return_attention_mask=True, add_special_tokens=True)
-                        input_ids_buffer.extend(tokenized_batch['input_ids'])
+                    batch.append(next(it)['text'])
+                    states.append(self.sharded_dataset.state_dict())
                 except StopIteration:
-                    break
+                    done = True
+                if len(batch) == self.tokenization_batch_size: # or done:
+                    for s, tokenized in zip(states, self.tokenizer(batch, truncation=True, max_length=self.max_doc_length, padding=False, return_attention_mask=False, add_special_tokens=True)['input_ids']):
+                        self.states = s
+                        yield tokenized
+                    batch, states = [], []
 
-                combined = {'input_ids':[], 'attention_mask':[], 'cu_seqlens':[]}
-                cu_seqlen = 0
-                while len(combined['input_ids']) < self.context_len:
-                    input_ids = input_ids_buffer.popleft()
-                    combined['input_ids'] += input_ids
-                    combined['cu_seqlens'].append(cu_seqlen)
-                    cu_seqlen += len(input_ids)
-                combined['input_ids'] = combined['input_ids'][:self.context_len]
-                combined['cu_seqlens'].append(len(combined['input_ids'])-1) # NOTE - -1 is because of same context_len + 1 issue above, this could end up doubling up last cu so we need to fix that
+        def state_dict(self):
+            return dict(states=self.states, packed_tokens=deepcopy(self.packed_tokens), cu_seqlens=deepcopy(self.cu_seqlens))
 
-                yield combined
+        def load_state_dict(self, state_dict):
+            self.states = state_dict['states']
+            self.packed_tokens = deepcopy(state_dict['packed_tokens'])
+            self.cu_seqlens = deepcopy(state_dict['cu_seqlens'])
 
-    def collate_basic(batch):
-        # NOTE - currently this expects NO BATCH DIM
-        input_ids = torch.tensor(batch['input_ids']).unsqueeze(0)
-        batch['input_ids'] = input_ids[:,:-1]
-        batch['labels'] = input_ids[:,1:]
-        #cu_seqlens = batch['cu_seqlens']
-        #doc_lens = [batch['cu_seqlens'][i] - batch['cu_seqlens'][i-1] for i in range(1, len(batch['cu_seqlens']))]
-        #cu_seqlens = F.pad(torch.tensor(doc_lens, dtype=torch.int).cumsum(0).int(), (1, 0))
-        return batch # dict(input_ids=input_ids, labels=labels, cu_seqlens=cu_seqlens) #:q, cu_seqlens, int(lengths.max()), labels    
-    
+    import pickle
+    from torch.distributed.checkpoint.stateful import Stateful
+    from torchdata.stateful_dataloader import StatefulDataLoader
+    class ParallelAwareDataLoader(StatefulDataLoader, Stateful):
+        """
+        A wrapper around the StatefulDataLoader that ensures that the state is stored only once per DP rank.
+        """
+
+        def __init__(
+            self,
+            rank: int,
+            dataset: IterableDataset,
+            batch_size: int,
+            collate_fn: Callable | None = None,
+            num_workers: int = 0,
+            pin_memory: bool = False,
+            prefetch_factor: int = 2,
+            persistent_workers: bool = False,
+            snapshot_every_n_steps: Optional[int] = 1,
+        ):
+            super().__init__(
+                dataset=dataset,
+                batch_size=batch_size,
+                collate_fn=collate_fn,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers,
+                snapshot_every_n_steps=snapshot_every_n_steps,
+            )
+            self.rank = rank
+
+        def state_dict(self) -> Dict[str, Any]:
+            # Store state only for dp rank to avoid replicating the same state across other dimensions
+            return {f'rank_{self.rank}': pickle.dumps(super().state_dict())}
+
+        def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+            # State being empty is valid
+            if not state_dict:
+                return
+
+            if f'rank_{self.rank}' not in state_dict:
+                # FIXME - need logger
+                #logger.warning(f'DataLoader state is empty for dp rank {self.rank}, expected key rank_{self.rank}')
+                return
+            super().load_state_dict(pickle.loads(state_dict[f'rank_{self.rank}']))
+
     tokenizer = AutoTokenizer.from_pretrained(model_config.tokenizer)    
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    if not master_process:
-        torch.distributed.barrier()
+    #if not master_process:
+    #    torch.distributed.barrier()
     dataset = load_dataset(args.train_dataset, name=args.train_dataset_name, split="train", streaming=False)
     # NOTE - we could maybe allow the sampler to do the shuffling instead, but the 'select' should happen after shuffling and maybe having select helps processing speed??
-    train_dataset = dataset.shuffle(seed=42).select(range(args.num_iterations * B * ddp_world_size))
+    train_dataset = dataset.shuffle(seed=42) #.select(range(args.num_iterations * B * ddp_world_size))
     val_dataset = dataset.shuffle(seed=0) #.select(range(val_steps * args.val_device_batch_size * ddp_world_size))
-    if master_process:
-        torch.distributed.barrier()
+    #if master_process:
+    #    torch.distributed.barrier()
 
-    train_dataset = ContextPackedDataset(train_dataset, context_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
+    num_workers = 1
 
-    val_dataset = ContextPackedDataset(val_dataset, context_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
+    def process_dataset(dataset):
+        if 'text' in dataset.column_names:
+            return dataset.select_columns('text')
+        elif 'content' in dataset.column_names:
+            return dataset.select_columns('content').rename_columns('content', 'text')
+        else:
+            raise ValueError(
+                f"Dataset {dataset} has no column named 'text' or 'content'"
+            )
+    
+    train_dataset = ContextPackedDataset(process_dataset(train_dataset), rank=ddp_rank, world_size=ddp_world_size, sequence_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
+
+    val_dataset = ContextPackedDataset(process_dataset(val_dataset), rank=ddp_rank, world_size=ddp_world_size, sequence_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
 
     torch.set_default_device(old_default_device)
 
-    train_data_loader = DataLoader(
-        train_dataset,
+    train_data_loader = ParallelAwareDataLoader(
+        dataset=train_dataset,
         batch_size=None,
-        collate_fn=collate_basic,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
+        rank=ddp_rank,
     )
 
-    val_data_loader = DataLoader(
-        val_dataset,
+    val_data_loader = ParallelAwareDataLoader(
+        dataset=val_dataset,
         batch_size=None,
-        collate_fn=collate_basic,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
+        rank=ddp_rank,
     )
     
 elif args.data_packing == 'pack':
@@ -776,7 +872,7 @@ for step in range(args.num_iterations + 1):
                 val_datum = next(val_loader)
                 x_val, y_val, cu_seqlens_val, attention_mask_val = val_datum['input_ids'], val_datum['labels'], val_datum.get('cu_seqlens'), val_datum.get('attention_mask')
                 #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                val_results = model(x_val, y_val, cu_seqlens, return_acc=True)
+                val_results = model(x_val, y_val, cu_seqlens_val, return_acc=True)
                 val_loss += val_results['loss']
                 val_acc += val_results['acc']
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
