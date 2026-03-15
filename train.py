@@ -607,6 +607,8 @@ if args.data_packing == 'varlen':
     
     train_dataset = ContextPackedDataset(process_dataset(train_dataset), rank=ddp_rank, world_size=ddp_world_size, sequence_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
 
+    # FIXME - train/val set overlap - if they are same dataset then make a split
+
     val_dataset = ContextPackedDataset(process_dataset(val_dataset), rank=ddp_rank, world_size=ddp_world_size, sequence_len=args.sequence_length, max_doc_length=args.max_document_length, tokenizer=tokenizer)
 
     torch.set_default_device(old_default_device)
