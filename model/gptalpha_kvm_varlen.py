@@ -4,12 +4,13 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 
+import torch.distributed as dist
+
 from utils.defer import defer
 
 from utils.init import orthogonal_, ortho_init
 from utils.grad_cp import maybe_ckpt, separately_compiled_flex_attention, causal_mask_mod, set_label
 from torch.nn.attention.flex_attention import create_block_mask, _create_sparse_block_from_block_mask
-
 
 @defer(torch.compile)
 def rms_norm(x):
@@ -65,7 +66,6 @@ def apply_rotary_embeddings(x_BTHD, positional_embeddings):
         )
         x_flip = x_BTHD.view(*x_BTHD.shape[:-1], x_BTHD.shape[-1] // 2, 2).flip(-1).view(x_BTHD.shape)
         return cos * x_BTHD + sin * x_flip
-
 
 class CausalSelfAttention(nn.Module):
 
@@ -243,7 +243,6 @@ class CausalSelfAttention(nn.Module):
         if self.use_state_decay:
             # FIXME - tokenshift this
             log_state_decay = -F.softplus(self.state_decay_proj(x).view(B, T, H, 1).transpose(1, 2).view(B, H, T, 1))
-            #log_state_decay = log_state_decay.clamp_min(math.log(0.5))
         else:
             log_state_decay = None
             
@@ -306,6 +305,7 @@ class CausalSelfAttention(nn.Module):
         v_with_states = torch.cat([v, *d_vs], dim=-2).bfloat16()
 
         return separately_compiled_flex_attention(query=q, key=k_with_states, value=v_with_states, block_mask=block_mask, enable_gqa=False)
+
 
 class MLP(nn.Module):
 
@@ -397,7 +397,147 @@ class GPT(nn.Module):
         x = self.ln_emb(x) # @Grad62304977
         dx0 = F.pad(x, [0,0,1,-1]) - x
         return x, dx0
-    
+
+    def create_batched_block_mask(self, B, T, chunk_len:int, n_bswa_chunks:int, device):
+        num_token_doc_ids = B*T
+        num_q_chunk_ids = num_token_doc_ids // chunk_len
+        n_docs = B
+        
+        # 1. Calculate lengths of each document
+        doc_lengths = torch.full([B], fill_value=T, dtype=torch.int32, device=device)
+        # doc_lengths -> [3, 2, 4]
+
+        # 2. Generate document IDs (0, 1, 2) and repeat them by their length
+        sequence_doc_ids_range = torch.arange(n_docs, device=device)
+        #token_doc_ids = torch.repeat_interleave(sequence_doc_ids_range, doc_lengths) # need this for non block-aligned docs
+
+        # FIXME - consider case where more than one doc can inhabit a chunk
+        doc_chunk_lengths = torch.full([B], fill_value=T//chunk_len, dtype=torch.int32, device=device)
+        chunk_doc_ids = torch.repeat_interleave(sequence_doc_ids_range, doc_chunk_lengths)
+
+        #num_state_chunk_ids = (doc_lengths // chunk_len - n_bswa_chunks - 1).clamp_min(0).sum().int().item()
+
+        sink_mask = torch.zeros([B,T], dtype=torch.bool, device=device)
+        sink_mask[:,0] = True
+        sink_mask = sink_mask.view(B*T)
+
+        # example of document with 4 chunks, where n_bswa_chunks==2
+        # 0123
+        # state is added as block 4
+        # 01234
+        # block 0 query attention is on 0 as partial block with causal mask
+        # block 1 query attention is on 0 full, 1 partial
+        # block 2 query attention is on 0[pseudo-state], 1 full, 2 partial
+        # block 3 query attention is on 4(state), 2 full, 3 partial
+        # q_chunk state attendance ids:
+        # -1 -1 0  4
+
+        # example of two documents with 5 chunks, where n_bswa_chunks==2
+        # 01234
+        # 56789
+        # state compressing 1 into 0 and 6 into 5 is added as block 10,11
+        # 0  1  2  3  4 10
+        # 5  6  7  8  9 11
+        # state compressing 2 into 12 and 7 into 11 is added as block 12,13
+        # 0  1  2  3  4 10 12
+        # 5  6  7  8  9 11 13
+        # block 0 query attention is on 0 as partial block with causal mask
+        # block 1 query attention is on 0 full, 1 partial
+        # block 2 query attention is on 0[pseudo-state], 1 full, 2 partial
+        # block 3 query attention is on 10(state), 2 full, 3 partial
+        # block 4 query attention is on 11(state), 3 full, 4 partial
+        # block 5 query attention is on 5 as partial block with causal mask
+        # block 6 query attention is on 5 full, 6 partial
+        # block 7 query attention is on 5[pseudo-state], 6 full, 7 partial
+        # block 8 query attention is on 12(state), 7 full, 8 partial
+        # block 9 query attention is on 13(state), 8 full, 9 partial
+        # q_chunk state attendance ids:
+        # -1 -1 0  10 12
+        # -1 -1 4  11 13
+
+        # ragged example of two documents with 4,5 chunks, where n_bswa_chunks==2
+        # 0  1  2  3
+        # 4  5  6  7  8
+        # state compressing 1 into 0 and 5 into 4 is added as block 9,10
+        # 0  1  2  3  9
+        # 4  5  6  7  8  10
+        # state compressing 6 into 10 is added as block 11
+        # 0  1  2  3  9 
+        # 4  5  6  7  8  10  11
+        # block 0 query attention is on 0 as partial block with causal mask
+        # block 1 query attention is on 0 full, 1 partial
+        # block 2 query attention is on 0[pseudo-state], 1 full, 2 partial
+        # block 3 query attention is on 9(state), 2 full, 3 partial
+        # block 4 query attention is on 4 as partial block with causal mask
+        # block 5 query attention is on 4 full, 5 partial
+        # block 6 query attention is on 4[pseudo-state], 5 full, 6 partial
+        # block 7 query attention is on 10(state), 6 full, 7 partial
+        # block 9 query attention is on 11(state), 7 full, 8 partial
+        # q_chunk state attendance ids:
+        # -1 -1 0  9  
+        # -1 -1 4  10 11
+
+        all_state_attendance_chunk_indices = [-1] * num_q_chunk_ids
+        state_update_chunk_index_batches = []
+        state_chunk_index = num_q_chunk_ids
+        max_doc_chunk_len = T//chunk_len
+        for batch_chunk_offset in range(n_bswa_chunks, max_doc_chunk_len):
+            batch_state_update_chunk_indices = []
+            for doc_id in range(B):
+                doc_begin_chunk = doc_id * T//chunk_len
+                current_chunk = doc_begin_chunk + batch_chunk_offset
+                if batch_chunk_offset == n_bswa_chunks:
+                    all_state_attendance_chunk_indices[current_chunk] = doc_begin_chunk
+                else: #batch_chunk_offset > n_bswa_chunks:
+                    all_state_attendance_chunk_indices[current_chunk] = state_chunk_index
+                    batch_state_update_chunk_indices.append(doc_begin_chunk + batch_chunk_offset - n_bswa_chunks)
+                    state_chunk_index += 1
+            if batch_chunk_offset > n_bswa_chunks:
+                state_update_chunk_index_batches.append(torch.tensor(batch_state_update_chunk_indices, dtype=int, device='cpu'))
+
+        state_update_chunk_indices = torch.cat(state_update_chunk_index_batches, dim=0)
+        num_state_chunk_ids = state_update_chunk_indices.shape[0]
+        state_update_chunk_batch_lengths = [b.shape[0] for b in state_update_chunk_index_batches]
+
+        all_state_attendance_chunk_indices = torch.tensor(all_state_attendance_chunk_indices, dtype=torch.int32, device=device)[:, None]
+
+        q_len = num_token_doc_ids
+        kv_len = num_token_doc_ids + num_state_chunk_ids * chunk_len
+        
+        qblock_idx_gpu = torch.arange(q_len // chunk_len, dtype=torch.int32, device=device)[:, None]
+        # arranged in chunk order across the actual document chunks, and then continuing to the states
+        kblock_idx_gpu = torch.arange(kv_len // chunk_len, dtype=torch.int32, device=device)[None, :]
+
+        chunk_doc_ids = F.pad(chunk_doc_ids, [0, num_state_chunk_ids], value=-1) # pad out the kv chunks so that the following line won't access OOB
+        bswa_doc_id_full_block_mask = (kblock_idx_gpu > qblock_idx_gpu - n_bswa_chunks) & (kblock_idx_gpu < qblock_idx_gpu) & (chunk_doc_ids[kblock_idx_gpu] == chunk_doc_ids[qblock_idx_gpu])
+
+        state_full_block_mask = all_state_attendance_chunk_indices == kblock_idx_gpu
+
+        # calculate partial blocks
+        # start with blocks that have an internal causal mask (along the block diagonal)
+        partial_block_mask = kblock_idx_gpu == qblock_idx_gpu
+        # FIXME - also take into account any non-block-aligned document starts and ends within the block sliding window
+
+        full_block_mask = bswa_doc_id_full_block_mask | state_full_block_mask
+        full_block_mask = full_block_mask & (~partial_block_mask) # be careful to mask off any partial blocks
+
+        # if dist.get_rank() == 0:
+        #     print('\nchunk_doc_ids\n', chunk_doc_ids)
+        #     print('\nstate_update_chunk_index_batches\n',state_update_chunk_index_batches)
+        #     print('\nall_state_attendance_chunk_indices\n',all_state_attendance_chunk_indices)
+        #     print('\nfull_block_mask\n',)
+        #     for i in range(full_block_mask.shape[0]):
+        #         print(full_block_mask[i].int())
+        # exit()
+
+        mask_mod = causal_mask_mod # would need to change if we consider non-block-aligned docs
+        block_mask = _create_sparse_block_from_block_mask((partial_block_mask[None, None, :, :], full_block_mask[None, None, :, :]), mask_mod, (q_len, kv_len), chunk_len, chunk_len)
+
+        return block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices
+
+        
+
+
     def create_full_batches_block_mask(self, cu_seqlens:list[int], chunk_len:int, n_bswa_chunks:int, device):
         #cu_seqlens = [x for x in range(0, self.config.sequence_length*B+1, self.config.sequence_length)]
     
@@ -618,7 +758,8 @@ class GPT(nn.Module):
             cu_seqlens = [x for x in range(0, self.config.sequence_length*B+1, self.config.sequence_length)]
 
         #block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_full_batches_block_mask(cu_seqlens, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
-        block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_varlen_block_mask(cu_seqlens, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
+        #block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_varlen_block_mask(cu_seqlens, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
+        block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_batched_block_mask(B, T, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
 
         q_len = B*T
 
