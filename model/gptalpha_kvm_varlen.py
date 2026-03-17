@@ -117,11 +117,6 @@ class CausalSelfAttention(nn.Module):
         self.n_max_d_chunks = 1
         self.n_bswa_chunks = 2
 
-        global BSWA_CHUNK_LEN, BSWA_NUM_CHUNKS
-        BSWA_CHUNK_LEN = self.chunk_len
-        BSWA_NUM_CHUNKS = self.n_bswa_chunks
-        self.block_mask = create_block_mask(mask_mod=bswa_mask_mod, B=None, H=None, Q_LEN=config.sequence_length, KV_LEN=config.sequence_length)
-
         self.ln_res = set_label('scalars2', nn.LayerNorm(config.d_embed))
 
         self.rope_zeroing = True
@@ -129,7 +124,6 @@ class CausalSelfAttention(nn.Module):
         self.attn_type = 'kvm'
         assert self.attn_type in ['sdpa', 'bswa', 'kvm']
 
-        self.use_fox = False
         self.use_state_decay = True
         self.use_state_deltarule = False
         self.use_rope = True
@@ -144,9 +138,6 @@ class CausalSelfAttention(nn.Module):
 
         if self.use_key_weighting:
             self.key_weighting = set_label('matrix_params', nn.Linear(config.d_embed, self.n_head, bias=False))
-
-        if self.use_fox:
-            self.decay_w = set_label('matrix_params', nn.Linear(config.d_embed, self.n_head, bias=False))
 
         self.use_head_temp = True
         if self.use_head_temp:
@@ -206,18 +197,18 @@ class CausalSelfAttention(nn.Module):
         return residual + y
     
     @defer(torch.compile)
-    def calculate_updated_state_for_chunk_batch(self, c_k_0, c_v, key_weighting, log_state_decay, d_k, d_v):
-        d_k_norm = self.ln_d_k(d_k)
-        sim = c_k_0 @ d_k_norm.mT # [B, H, C_T, D_T]
+    def calculate_updated_state_for_chunk_batch(self, input_k_0, input_v, log_state_decay, state_k, state_v):
+        state_k_norm = self.ln_d_k(state_k)
+        sim = input_k_0 @ state_k_norm.mT # [B, H, C_T, D_T]
         sim[...,0:self.sink_len] = float('-inf')
-        best_sim, best_d_idx = sim.max(dim=-1, keepdim=True)  # [B, H, C_T, 1]
-        sim_max = torch.scatter(torch.zeros_like(sim), -1, best_d_idx, torch.ones_like(sim)) # [B, H, C_T, D_T]
+        best_sim, best_state_idx = sim.max(dim=-1, keepdim=True)  # [B, H, C_T, 1]
+        sim_max = torch.scatter(torch.zeros_like(sim), -1, best_state_idx, torch.ones_like(sim)) # [B, H, C_T, D_T]
         if self.use_state_decay:
             state_decay_compounded = torch.exp(sim_max.mT @ log_state_decay)
-            d_v = d_v * state_decay_compounded
-        d_k = d_k + (sim_max.mT @ (c_k_0 * key_weighting)) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
-        d_v = d_v + (sim_max.mT @ (c_v * key_weighting)) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
-        return d_k, d_v
+            state_v = state_v * state_decay_compounded
+        state_k = state_k + (sim_max.mT @ input_k_0) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
+        state_v = state_v + (sim_max.mT @ input_v) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
+        return state_k, state_v
 
     def kvm_attention(self, x, q, k, v, block_mask, state_update_chunk_batch_lengths:list[int], state_update_chunk_indices:torch.Tensor):
         B, H, T, N = q.shape
@@ -228,18 +219,6 @@ class CausalSelfAttention(nn.Module):
         else:
             key_weighting = None
 
-        if self.use_fox:
-            # FIXME - tokenshift this
-            log_f = F.logsigmoid(self.decay_w(x).view(B, T, H).float())
-
-            exclusive_prefix_sum = True
-            if exclusive_prefix_sum:
-                log_f = F.pad(log_f, (0, 0, 1, -1))
-
-            log_f = log_f.transpose(1, 2)
-        else:
-            log_f = None
-
         if self.use_state_decay:
             # FIXME - tokenshift this
             log_state_decay = -F.softplus(self.state_decay_proj(x).view(B, T, H, 1).transpose(1, 2).view(B, H, T, 1))
@@ -247,62 +226,63 @@ class CausalSelfAttention(nn.Module):
             log_state_decay = None
             
         k_chunks, v_chunks, key_weighting_chunks, log_state_decay_chunks = [
-            x.view(*x.shape[:2], x.shape[2]//chunk_len, chunk_len, *x.shape[3:]) for x in [k, v, key_weighting, log_state_decay]
+            x.view(*x.shape[:2], T//chunk_len, chunk_len, *x.shape[3:]) for x in [k, v, key_weighting, log_state_decay]
         ]
 
         def apply_rope_zeroing_and_ln(x):
             if self.use_rope and self.rope_zeroing:
-                return self.ln_d_k(F.pad(x[...,self.rope_partial_dim:], [self.rope_partial_dim, 0]))
-            else:
-                return x # for no rope-zeroing
+                x = F.pad(x[...,self.rope_partial_dim:], [N - self.rope_partial_dim, 0])
+            # FIXME - why did we used to apply ln_d_k here? I would think we'd use a different layernorm for state_k and input_k than for the final state_k_to_store
+            return self.ln_d_k(x)
 
-        # initialize d_k, d_v for first batch from prior chunk k, v's
-        first_chunk_index_batch = state_update_chunk_indices[0:state_update_chunk_batch_lengths[0]]
-        d_k = apply_rope_zeroing_and_ln(k_chunks[..., first_chunk_index_batch - 1, :, :])
-        d_v = v_chunks[..., first_chunk_index_batch - 1, :, :]
-        d_vlen = torch.norm(d_v.float(), dim=-1, keepdim=True)
+        # initialize state_k, state_v for first batch from prior chunk k, v's
+        zeroth_chunk_index_batch = state_update_chunk_indices[0:state_update_chunk_batch_lengths[0]] - 1
+        state_k = apply_rope_zeroing_and_ln(k_chunks[:, :, zeroth_chunk_index_batch, :, :])
+        state_v = v_chunks[:, :, zeroth_chunk_index_batch, :, :]
+        state_vlen = torch.norm(state_v.float(), dim=-1, keepdim=True)
 
         # take the subset of chunks that will be used as inputs for state updates, reordered into chunk processing order, from the main chunked tensors
-        # CPO stands for Chunk Processing Order
-        ln_k_rope_zeroed_CPO = apply_rope_zeroing_and_ln(k_chunks[..., state_update_chunk_indices, :, :])
-        v_CPO = v_chunks[..., state_update_chunk_indices, :, :]
-        key_weighting_CPO = key_weighting_chunks[..., state_update_chunk_indices, :, :]
-        log_state_decay_CPO = log_state_decay_chunks[..., state_update_chunk_indices, :, :]
+        # SO stands for State update Ordering
+        key_weighting_SO = key_weighting_chunks[:, :, state_update_chunk_indices, :, :]
+        ln_rope_zeroed_input_k_SO = apply_rope_zeroing_and_ln(k_chunks[:, :, state_update_chunk_indices, :, :]) * key_weighting_SO
+        input_v_SO = v_chunks[:, :, state_update_chunk_indices, :, :] * key_weighting_SO
+        log_state_decay_SO = log_state_decay_chunks[:, :, state_update_chunk_indices, :, :]
 
-        d_ks = []
-        d_vs = []
-        offset_CPO = 0
-        for batch_length_CPO in state_update_chunk_batch_lengths:
-            # FIXME - remove d_k, d_v, d_vlen for batch entries that are no longer present for this next batch 
+        state_ks = []
+        state_vs = []
+        begin_chunk_SO = 0
+        for batch_length_SO in state_update_chunk_batch_lengths:
+            # FIXME - remove state_k, state_v, state_vlen for batch entries that are no longer present for this next batch 
 
-            # create the states for this chunk batch
-            end_CPO = offset_CPO + batch_length_CPO
-            c_k_0 = ln_k_rope_zeroed_CPO[..., offset_CPO:end_CPO, :, :]
-            c_v = v_CPO[..., offset_CPO:end_CPO, :, :]
-            key_weighting_current = key_weighting_CPO[..., offset_CPO:end_CPO, :, :]
-            log_state_decay_current = log_state_decay_CPO[..., offset_CPO:end_CPO, :, :]
+            # create the updated states for this chunk batch
+            end_chunk_SO = begin_chunk_SO + batch_length_SO
+            state_k, state_v = self.calculate_updated_state_for_chunk_batch(
+                input_k_0=ln_rope_zeroed_input_k_SO[:, :, begin_chunk_SO:end_chunk_SO, :, :],
+                input_v=input_v_SO[:, :, begin_chunk_SO:end_chunk_SO, :, :], 
+                log_state_decay=log_state_decay_SO[:, :, begin_chunk_SO:end_chunk_SO, :, :], 
+                state_k=state_k, state_v=state_v)
 
-            d_k, d_v = self.calculate_updated_state_for_chunk_batch(c_k_0=c_k_0, c_v=c_v, key_weighting=key_weighting_current, log_state_decay=log_state_decay_current, d_k=d_k, d_v=d_v)
-            d_k_to_store, d_v_to_store = d_k, d_v
-            # putting this outside of the inner loop function because it can applied in parallel across chunks in the batch
+            # keep these separate so we don't mess up the current state
+            state_k_to_store, state_v_to_store = state_k, state_v
             if self.use_head_temp:
+                # FIXME - in the original implementation we used state_head_temp for even the first state initialized from the original keys+values, rather than front_head_temp
+                # FIXME - we also applied ln_k and rope zeroing to it, treating it like a true state
                 state_head_temp = self.state_head_temp.view(1, H, 1, 1, 1)
-                d_k_to_store = d_k_to_store * state_head_temp
+                state_k_to_store = state_k_to_store * state_head_temp
+            # we normalize state_v_to_store and multiply by state_vlen when storing it because v_star = torch.cat([(F.normalize(state_v.float(), dim=-1) * state_vlen).bfloat16(), bswa_v], dim=2)
+            state_v_to_store = (F.normalize(state_v_to_store.float(), dim=-1) * state_vlen).to(state_v_to_store.dtype)
 
-            # we normalize d_v and multiply by d_vlen when storing it because v_star = torch.cat([(F.normalize(d_v.float(), dim=-1) * d_vlen).bfloat16(), bswa_v], dim=2)
-            d_v_to_store = (F.normalize(d_v_to_store.float(), dim=-1) * d_vlen).bfloat16()
+            state_ks.append(state_k_to_store.reshape(*state_k_to_store.shape[:2], -1, *state_k_to_store.shape[4:]))
+            state_vs.append(state_v_to_store.reshape(*state_v_to_store.shape[:2], -1, *state_v_to_store.shape[4:]))
 
-            d_ks.append(d_k_to_store.reshape(*d_k_to_store.shape[:2], -1, *d_k_to_store.shape[4:]))
-            d_vs.append(d_v_to_store.reshape(*d_v_to_store.shape[:2], -1, *d_v_to_store.shape[4:]))
-
-            offset_CPO += batch_length_CPO
+            begin_chunk_SO += batch_length_SO
 
         if self.use_head_temp:
             front_head_temp = self.front_head_temp.view(1, H, 1, 1)
             k = k * front_head_temp
 
-        k_with_states = torch.cat([k, *d_ks], dim=-2)
-        v_with_states = torch.cat([v, *d_vs], dim=-2).bfloat16()
+        k_with_states = torch.cat([k, *state_ks], dim=-2)
+        v_with_states = torch.cat([v, *state_vs], dim=-2)
 
         return separately_compiled_flex_attention(query=q, key=k_with_states, value=v_with_states, block_mask=block_mask, enable_gqa=False)
 
@@ -689,11 +669,11 @@ class GPT(nn.Module):
         for doc_begin, doc_end in zip(docs_begin, docs_end):
             # if the document beginning is not block aligned, then all bswa window queries must see that key as a partial block
             if doc_begin % chunk_len != 0:
-                partial_block_mask[..., doc_begin//chunk_len+1 : doc_begin//chunk_len + n_bswa_chunks, doc_begin // chunk_len] = True
+                partial_block_mask[:, :, doc_begin//chunk_len+1 : doc_begin//chunk_len + n_bswa_chunks, doc_begin // chunk_len] = True
                 has_any_nonchunkaligned_docs = True
             # if the document end is not block aligned, then the end block must see all bswa window keys as a partial block
             if doc_end % chunk_len != 0:
-                partial_block_mask[..., doc_end//chunk_len, doc_end//chunk_len - n_bswa_chunks : doc_end//chunk_len] = True
+                partial_block_mask[:, :, doc_end//chunk_len, doc_end//chunk_len - n_bswa_chunks : doc_end//chunk_len] = True
                 has_any_nonchunkaligned_docs = True
         partial_block_mask = partial_block_mask.to(device)
 
