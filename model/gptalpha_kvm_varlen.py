@@ -295,7 +295,7 @@ class CausalSelfAttention(nn.Module):
         state_k_norm = self.ln_d_k(state_k)
         state_head_temp = self.state_head_temp.view(1, -1, 1, 1)
         if len(state_k.shape) == 5:
-            state_head_temp.unsqueeze(-1)
+            state_head_temp = state_head_temp.unsqueeze(-1)
         # FIXME - in the original implementation we used state_head_temp for even the first state initialized from the original keys+values, rather than front_head_temp
         # FIXME - we also applied ln_k and rope zeroing to it, treating it like a true state
         state_k_to_store = state_k_norm * state_head_temp
