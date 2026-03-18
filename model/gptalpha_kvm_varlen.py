@@ -461,28 +461,70 @@ class GPT(nn.Module):
         dx0 = F.pad(x, [0,0,1,-1]) - x
         return x, dx0
 
-    def create_batched_block_mask(self, B, T, chunk_len:int, n_bswa_chunks:int, device):
-        num_token_doc_ids = B*T
-        num_q_chunk_ids = num_token_doc_ids // chunk_len
-        n_docs = B
+    def sort_pad_and_chunk_align(self, x:torch.Tensor, cu_seqlens:list[int], chunk_len:int, n_bswa_chunks:int):
+        # pad and chunk-align documents longer than n_bswa_chunks, and pack short documents at the end
+        n_docs = len(cu_seqlens) - 1
+        long_docs = []
+        short_docs = []
+        short_doc_max_len = (n_bswa_chunks + 1) * chunk_len
+        for doc_id in range(n_docs):
+            doc_begin = cu_seqlens[doc_id]
+            doc_unpadded_len = cu_seqlens[doc_id+1] - doc_begin
+            doc_tensor = x[doc_begin:doc_unpadded_len]
+            if doc_unpadded_len < short_doc_max_len:
+                short_docs.append((doc_id, doc_unpadded_len, doc_tensor))
+            else:
+                padding_len = (doc_unpadded_len+chunk_len-1)//chunk_len - doc_unpadded_len
+                if padding_len > 0:
+                    doc_tensor = F.pad(doc_tensor, [0, padding_len])
+                long_docs.append((doc_id, doc_unpadded_len, doc_tensor))
+
+        all_docs = long_docs + short_docs
+        aligned_padded_x = torch.cat([doc[2] for doc in all_docs], dim=-1)
+        new_cu_seqlens = []
+        offset = 0
+        sortable_docs = []
+        new_cu_seqlens.append(offset)
+        for doc_id, doc_unpadded_len, doc_tensor in all_docs:
+            sortable_docs.append((doc_id, offset, offset+doc_unpadded_len))
+            offset += doc_tensor.shape[-1]
+            new_cu_seqlens.append(offset)
+
+        sortable_docs.sort(key=lambda doc:doc[0])
+        doc_map = [(doc[1], doc[2]) for doc in sortable_docs]
+
+        return aligned_padded_x, new_cu_seqlens, doc_map
+
+    def undo_sort_pad_and_chunk_align(self, x:torch.Tensor, cu_seqlens:list[int], doc_map:list[tuple[int, int]]):
+        outs = []
+        for doc_begin, doc_end in doc_map:
+            outs.append(x[..., doc_begin:doc_end, :])
+        return torch.cat(outs, dim=-2)
+
+    def create_varlen_block_mask(self, cu_seqlens:list[int], chunk_len:int, n_bswa_chunks:int, device):
+        def chunkceil(x):
+            return (x + chunk_len - 1) // chunk_len
+
+        n_docs = len(cu_seqlens) - 1
+        doc_begins = cu_seqlens[:-1]
+        doc_ends = cu_seqlens[1:]
+
+        n_token_doc_ids = cu_seqlens[-1]
+        # FIXME - should we pad all tokens to chunklen?
+        n_input_chunk_ids = n_token_doc_ids // chunk_len
         
+        cu_seqlens:torch.Tensor = torch.tensor(cu_seqlens, dtype=torch.int, device=device)
+
         # 1. Calculate lengths of each document
-        doc_lengths = torch.full([B], fill_value=T, dtype=torch.int32, device=device)
+        doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         # doc_lengths -> [3, 2, 4]
 
         # 2. Generate document IDs (0, 1, 2) and repeat them by their length
-        sequence_doc_ids_range = torch.arange(n_docs, device=device)
-        #token_doc_ids = torch.repeat_interleave(sequence_doc_ids_range, doc_lengths) # need this for non block-aligned docs
+        token_doc_ids_range = torch.arange(n_docs, device=device)
+        token_doc_ids = torch.repeat_interleave(token_doc_ids_range, doc_lengths) # need this for non block-aligned docs
 
-        # FIXME - consider case where more than one doc can inhabit a chunk
-        doc_chunk_lengths = torch.full([B], fill_value=T//chunk_len, dtype=torch.int32, device=device)
-        chunk_doc_ids = torch.repeat_interleave(sequence_doc_ids_range, doc_chunk_lengths)
-
-        #num_state_chunk_ids = (doc_lengths // chunk_len - n_bswa_chunks - 1).clamp_min(0).sum().int().item()
-
-        sink_mask = torch.zeros([B,T], dtype=torch.bool, device=device)
-        sink_mask[:,0] = True
-        sink_mask = sink_mask.view(B*T)
+        sink_mask = torch.zeros([n_token_doc_ids], dtype=torch.bool, device=device)
+        sink_mask[cu_seqlens[:-1]] = True
 
         # example of document with 4 chunks, where n_bswa_chunks==2
         # 0123
@@ -540,18 +582,20 @@ class GPT(nn.Module):
         # -1 -1 0  9  
         # -1 -1 4  10 11
 
-        max_doc_chunk_len = T//chunk_len
-        all_state_attendance_chunk_indices = [-1] * num_q_chunk_ids
+        max_doc_chunk_len = chunkceil(max(doc_lengths))
+        all_state_attendance_chunk_indices = [-1] * n_input_chunk_ids
 
         state_update_chunk_index_batches = []
-        state_chunk_index = num_q_chunk_ids
-        for doc_id in range(B):
-            doc_begin_chunk = doc_id * T//chunk_len
+        state_chunk_index = n_input_chunk_ids
+        batch_doc_ids = [doc_id for doc_id in range(n_docs) if chunkceil(doc_lengths[doc_id]) > 1]
+        for doc_id in batch_doc_ids:
+            doc_begin_chunk = doc_begins[doc_id]//chunk_len
             all_state_attendance_chunk_indices[doc_begin_chunk + n_bswa_chunks] = doc_begin_chunk
         for doc_chunk_offset in range(1, max_doc_chunk_len-n_bswa_chunks):
             batch_state_update_chunk_indices = []
-            for doc_id in range(B):
-                doc_begin_chunk = doc_id * T//chunk_len
+            batch_doc_ids = [doc_id for doc_id in batch_doc_ids if chunkceil(doc_lengths[doc_id]) > doc_chunk_offset]
+            for doc_id in batch_doc_ids:
+                doc_begin_chunk = doc_begins[doc_id]//chunk_len
                 doc_current_chunk = doc_begin_chunk + doc_chunk_offset
                 batch_state_update_chunk_indices.append(doc_current_chunk)
                 all_state_attendance_chunk_indices[doc_current_chunk + n_bswa_chunks] = state_chunk_index
@@ -564,13 +608,19 @@ class GPT(nn.Module):
 
         all_state_attendance_chunk_indices = torch.tensor(all_state_attendance_chunk_indices, dtype=torch.int32, device=device)[:, None]
 
-        q_len = num_token_doc_ids
-        kv_len = num_token_doc_ids + num_state_chunk_ids * chunk_len
+        q_len = n_token_doc_ids
+        kv_len = n_token_doc_ids + num_state_chunk_ids * chunk_len
         
         qblock_idx_gpu = torch.arange(q_len // chunk_len, dtype=torch.int32, device=device)[:, None]
         # arranged in chunk order across the actual document chunks, and then continuing to the states
         kblock_idx_gpu = torch.arange(kv_len // chunk_len, dtype=torch.int32, device=device)[None, :]
 
+        # FIXME - consider case where more than one doc can inhabit a chunk
+        chunk_doc_ids = torch.full([n_input_chunk_ids], fill_value=-1, dtype=torch.bool, device='cpu')
+        for doc_id, doc_begin, doc_end in zip(range(n_docs), doc_begins, doc_ends):
+            for chunk_id in range(chunkceil(doc_begin), doc_end//chunk_len):
+                chunk_doc_ids[chunk_id] = doc_id
+        chunk_doc_ids = chunk_doc_ids.to(device)
         chunk_doc_ids = F.pad(chunk_doc_ids, [0, num_state_chunk_ids], value=-1) # pad out the kv chunks so that the following line won't access OOB
         bswa_doc_id_full_block_mask = (kblock_idx_gpu > qblock_idx_gpu - n_bswa_chunks) & (kblock_idx_gpu < qblock_idx_gpu) & (chunk_doc_ids[kblock_idx_gpu] == chunk_doc_ids[qblock_idx_gpu])
 
@@ -593,191 +643,11 @@ class GPT(nn.Module):
         #         print(full_block_mask[i].int())
         # exit()
 
-        mask_mod = causal_mask_mod # would need to change if we consider non-block-aligned docs
+        mask_mod = causal_mask_mod # FIXME - need to change if we consider non-block-aligned docs, including token_doc_ids for short docs
         block_mask = _create_sparse_block_from_block_mask((partial_block_mask[None, None, :, :], full_block_mask[None, None, :, :]), mask_mod, (q_len, kv_len), chunk_len, chunk_len)
 
         return block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices
-
-        
-
-
-    # def create_full_batches_block_mask(self, cu_seqlens:list[int], chunk_len:int, n_bswa_chunks:int, device):
-    #     #cu_seqlens = [x for x in range(0, self.config.sequence_length*B+1, self.config.sequence_length)]
-    
-    #     # FIXME - don't forget tokenshift masking for sink at beginning of every document
-
-    #     num_sequence_doc_ids = cu_seqlens[-1]
-
-    #     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=device)
-
-    #     state_update_chunk_index_batches = [torch.arange(chunk_offset, B * num_q_chunks, num_q_chunks) for chunk_offset in range(1, num_q_chunks - n_bswa_chunks)]
-    #     state_update_chunk_indices = torch.cat(state_update_chunk_index_batches, dim=0)
-    #     state_update_chunk_batch_lengths = [b.shape[0] for b in state_update_chunk_index_batches]
-
-    #     # 1. Calculate lengths of each document
-    #     doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1] 
-    #     # doc_lengths -> [3, 2, 4]
-
-    #     num_state_chunk_ids = (doc_lengths // chunk_len - n_bswa_chunks - 1).clamp_min(0).sum().int().item()
-
-    #     # 2. Generate document IDs (0, 1, 2) and repeat them by their length
-    #     sequence_doc_ids_range = torch.arange(len(doc_lengths), device=cu_seqlens.device)
-    #     sequence_doc_ids = torch.repeat_interleave(sequence_doc_ids_range, doc_lengths)
-
-    #     sequence_doc_ids = F.pad(sequence_doc_ids, [0, num_state_chunk_ids * chunk_len], value=-1)
-    #     #q_state_chunk_ids = torch.cat([torch.full([B, n_bswa_chunks + 1], fill_value=-1, device=device, dtype=torch.int), torch.arange(num_state_chunk_ids, device=device).view(B, -1)], dim=-1).view(-1)
-    #     #q_state_chunk_ids = F.pad(q_state_chunk_ids, [0, num_state_chunk_ids], value=-1)
-    #     q_state_chunk_ids = torch.full([num_sequence_doc_ids // chunk_len + num_state_chunk_ids], fill_value=-1, device=device, dtype=int)
-    #     state_chunk_index_counter = 0
-    #     #for chunk_index_batch in state_update_chunk_index_batches:
-    #     #    for chunk_index in chunk_index_batch:
-    #     for chunk_index in state_update_chunk_indices:
-    #         q_state_chunk_ids[chunk_index] = state_chunk_index_counter
-    #         state_chunk_index_counter += 1
-    #     k_state_chunk_ids = torch.arange(num_state_chunk_ids, device=device)
-    #     k_state_chunk_ids = F.pad(k_state_chunk_ids, [num_sequence_doc_ids // chunk_len, 0], value=-2)
-
-    #     sink_mask = torch.zeros([num_sequence_doc_ids], dtype=torch.bool, device=device)
-    #     sink_mask[cu_seqlens[:-1]] = True
-
-    #     q_len = num_sequence_doc_ids
-    #     kv_len = num_sequence_doc_ids + num_state_chunk_ids * chunk_len
-
-    #     qblock_idx = torch.arange(q_len // chunk_len, dtype=torch.int32, device=device)[None, None, :, None]
-    #     kblock_idx = torch.arange(kv_len // chunk_len, dtype=torch.int32, device=device)[None, None, None, :]
-
-    #     bswa_full_block_mask = (kblock_idx > qblock_idx - n_bswa_chunks) & (kblock_idx < qblock_idx)
-    #     state_full_block_mask = (kblock_idx >= num_sequence_doc_ids // chunk_len) & (q_state_chunk_ids[qblock_idx] == k_state_chunk_ids[kblock_idx])
-
-    #     # FIXME - also needs to take into account any non-block-aligned document starts
-    #     partial_block_mask = (kblock_idx == qblock_idx) #| (kblock_idx == (sink_indices // KV_BLOCK_SIZE).view(B,1,1,1))
-    #     full_block_mask = bswa_full_block_mask | state_full_block_mask
-
-    #     full_block_mask = full_block_mask & (~partial_block_mask)
-    #     block_mask = _create_sparse_block_from_block_mask((partial_block_mask, full_block_mask), causal_mask_mod, (q_len, kv_len), chunk_len, chunk_len)
-
-    #     return block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices
-
-    # def create_varlen_block_mask(self, cu_seqlens:list[int], chunk_len:int, n_bswa_chunks:int, device):
-    #     # FIXME - don't forget tokenshift masking for sink at beginning of every document
-
-    #     num_sequence_doc_ids = cu_seqlens[-1]
-
-    #     def chunkceil(x:int):
-    #         return (x+chunk_len-1)//chunk_len
-
-    #     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device='cpu')
-    #     docs_begin = cu_seqlens[:-1]
-    #     docs_end = cu_seqlens[1:]
-    #     # FIXME - ok so the problem now is that we aren't doing the extra BSWA chunk at first before the state is calculated so we're never seeing that as part of the state when we're
-    #     #  supposed to first see three chunks we only see two, even though afterwards we see two plus a correct state
-    #     docs_state_calc_begin_chunk = chunkceil(docs_begin) + 1
-    #     docs_state_calc_end_chunk = chunkceil(docs_end) - n_bswa_chunks # no need to calculate the state update for the first chunk in the last bswa window, since that state is never used
-    #     docs_state_calc_num_chunks = docs_state_calc_end_chunk - docs_state_calc_begin_chunk
-    #     doc_ids = list(range(docs_begin.shape[0]))
-    #     # get only the documents with state calcs, and sort those from longest to shortest number of state chunks
-    #     sorted_doc_ids = [doc_id for doc_id in doc_ids if docs_state_calc_num_chunks[doc_id] > 0]
-    #     sorted_doc_ids.sort(key=lambda doc_id: docs_state_calc_num_chunks[doc_id], reverse=True)
-
-    #     state_update_chunk_index_batches = []
-    #     batch_chunk_offset = 0
-    #     while len(sorted_doc_ids) > 0:
-    #         batch_chunk_indices = []
-    #         for doc_id in sorted_doc_ids:
-    #             batch_chunk_indices.append(docs_state_calc_begin_chunk[doc_id] + batch_chunk_offset)
-    #         state_update_chunk_index_batches.append(torch.tensor(batch_chunk_indices, dtype=int, device='cpu'))
-    #         batch_chunk_offset += 1
-    #         sorted_doc_ids = [doc_id for doc_id in sorted_doc_ids if docs_state_calc_num_chunks[doc_id] > batch_chunk_offset]
-
-    #     state_update_chunk_indices = torch.cat(state_update_chunk_index_batches, dim=0)
-    #     num_state_chunk_ids = state_update_chunk_indices.shape[0]
-    #     state_update_chunk_batch_lengths = [b.shape[0] for b in state_update_chunk_index_batches]
-
-
-    #     cu_seqlens = cu_seqlens.to(device)
-
-    #     sink_mask = torch.zeros([num_sequence_doc_ids], dtype=torch.bool, device=device)
-    #     sink_mask[cu_seqlens[:-1]] = True
-
-    #     # 1. Calculate lengths of each document
-    #     doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1] 
-    #     # doc_lengths -> [3, 2, 4]
-
-    #     # 2. Generate document IDs (0, 1, 2) and repeat them by their length
-    #     sequence_doc_ids_range = torch.arange(len(doc_lengths), device=cu_seqlens.device)
-    #     sequence_doc_ids = torch.repeat_interleave(sequence_doc_ids_range, doc_lengths)
-    #     # padding it to avoid a surprising crash where it appears flex_attention was accessing past the q_len of sequence_doc_ids despite there being no partial blocks past there
-    #     sequence_doc_ids = F.pad(sequence_doc_ids, [0, num_state_chunk_ids * chunk_len], value=-3)
-
-    #     # first document id that appears in each chunk, calculated by iterating over docs in reverse order
-    #     chunk_first_doc_ids = torch.full([num_sequence_doc_ids // chunk_len + num_state_chunk_ids], fill_value=-1, device='cpu', dtype=int)
-    #     for doc_id in reversed(doc_ids):
-    #         chunk_first_doc_ids[docs_begin[doc_id]//chunk_len : docs_end[doc_id]//chunk_len] = doc_id
-    #     chunk_first_doc_ids = chunk_first_doc_ids.to(device)
-
-    #     q_state_chunk_ids = torch.full([num_sequence_doc_ids // chunk_len + num_state_chunk_ids], fill_value=-1, device='cpu', dtype=int)
-    #     state_chunk_index_counter = 0
-    #     for chunk_index in state_update_chunk_indices:
-    #         q_state_chunk_ids[chunk_index] = state_chunk_index_counter
-    #         state_chunk_index_counter += 1
-    #     q_state_chunk_ids = q_state_chunk_ids.to(device)
-    #     k_state_chunk_ids = torch.arange(num_state_chunk_ids, device=device)
-    #     k_state_chunk_ids = F.pad(k_state_chunk_ids, [num_sequence_doc_ids // chunk_len, 0], value=-2)
-
-    #     state_update_chunk_indices = state_update_chunk_indices.to(device)
-
-    #     q_len = num_sequence_doc_ids
-    #     kv_len = num_sequence_doc_ids + num_state_chunk_ids * chunk_len
-
-    #     qblock_idx_gpu = torch.arange(q_len // chunk_len, dtype=torch.int32, device=device)[:, None]
-    #     kblock_idx_gpu = torch.arange(kv_len // chunk_len, dtype=torch.int32, device=device)[None, :]
-    #     qblock_idx_cpu = torch.arange(q_len // chunk_len, dtype=torch.int32, device='cpu')[:, None]
-    #     kblock_idx_cpu = torch.arange(kv_len // chunk_len, dtype=torch.int32, device='cpu')[None, :]
-    #     # FIXME - this mask isn't really correct for docs that start late in the block and still need to be attended for BSWA purposes
-    #     #  those docs need an extra block of BSWA at the beginning, before we calculate their first state!
-    #     #  this is also a problem in the calculation of batch_chunk_indices earlier above
-    #     bswa_doc_id_full_block_mask = (kblock_idx_gpu > qblock_idx_gpu - n_bswa_chunks) & (kblock_idx_gpu < qblock_idx_gpu) & (chunk_first_doc_ids[kblock_idx_gpu] == chunk_first_doc_ids[qblock_idx_gpu])
-    #     # FIXME - hack to add in the first state entry, does not obey constraints for docs that start on a non block boundary
-    #     for doc_id in doc_ids:
-    #         state_calc_begin_chunk = docs_state_calc_begin_chunk[doc_id]
-    #         if docs_end[doc_id] - docs_begin[doc_id] >= (n_bswa_chunks + 1) * chunk_len:
-    #             bswa_doc_id_full_block_mask[state_calc_begin_chunk-1+n_bswa_chunks, state_calc_begin_chunk-1] = True
-    #     state_full_block_mask = (kblock_idx_gpu >= num_sequence_doc_ids // chunk_len) & (q_state_chunk_ids[qblock_idx_gpu] == k_state_chunk_ids[kblock_idx_gpu])
-
-    #     # calculate partial blocks
-    #     # start with blocks that have an internal causal mask (along the block diagonal)
-    #     partial_block_mask = kblock_idx_cpu == qblock_idx_cpu
-    #     # also take into account any non-block-aligned document starts and ends within the block sliding window
-    #     has_any_nonchunkaligned_docs = False
-    #     for doc_begin, doc_end in zip(docs_begin, docs_end):
-    #         # if the document beginning is not block aligned, then all bswa window queries must see that key as a partial block
-    #         if doc_begin % chunk_len != 0:
-    #             partial_block_mask[:, :, doc_begin//chunk_len+1 : doc_begin//chunk_len + n_bswa_chunks, doc_begin // chunk_len] = True
-    #             has_any_nonchunkaligned_docs = True
-    #         # if the document end is not block aligned, then the end block must see all bswa window keys as a partial block
-    #         if doc_end % chunk_len != 0:
-    #             partial_block_mask[:, :, doc_end//chunk_len, doc_end//chunk_len - n_bswa_chunks : doc_end//chunk_len] = True
-    #             has_any_nonchunkaligned_docs = True
-    #     partial_block_mask = partial_block_mask.to(device)
-
-    #     full_block_mask = bswa_doc_id_full_block_mask | state_full_block_mask
-    #     full_block_mask = full_block_mask & (~partial_block_mask) # be careful to mask off any partial blocks
-
-    #     # use causal_doc_id_mask_mod when any docs are not completely block aligned (but it's really slow to compile!)
-    #     if has_any_nonchunkaligned_docs:
-    #     # create a mask mod for partial blocks based on document id per sequence pos
-    #         def causal_doc_id_mask_mod(b, h, q_idx, kv_idx):
-    #             causal_mask = q_idx >= kv_idx
-    #             document_mask = sequence_doc_ids[q_idx] == sequence_doc_ids[kv_idx]
-    #             return causal_mask & document_mask # bswa is handled already by missing entries in the combined partial and full chunk masks
-    #         mask_mod = causal_doc_id_mask_mod
-    #     else:
-    #         mask_mod = causal_mask_mod
-    #     block_mask = _create_sparse_block_from_block_mask((partial_block_mask[None, None, :, :], full_block_mask[None, None, :, :]), mask_mod, (q_len, kv_len), chunk_len, chunk_len)
-
-    #     return block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices
-    
-
+  
     def forward(self, token_ids, target, cu_seqlens=None, return_acc=False):
         # forward the GPT model itself
         x, dx0 = self.embed(token_ids)
@@ -821,9 +691,8 @@ class GPT(nn.Module):
         # if cu_seqlens is None:
         #     cu_seqlens = [x for x in range(0, self.config.sequence_length*B+1, self.config.sequence_length)]
 
-        #block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_full_batches_block_mask(cu_seqlens, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
-        #block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_varlen_block_mask(cu_seqlens, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
-        block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_batched_block_mask(B, T, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
+        cu_seqlens = [x for x in range(0, self.config.sequence_length*B+1, self.config.sequence_length)]
+        block_mask, sink_mask, state_update_chunk_batch_lengths, state_update_chunk_indices = self.create_varlen_block_mask(cu_seqlens=cu_seqlens, chunk_len=chunk_len, n_bswa_chunks=n_bswa_chunks, device=x.device)
 
         q_len = B*T
 
