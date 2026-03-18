@@ -239,107 +239,68 @@ class CausalSelfAttention(nn.Module):
 
         causal_mask = _lower_right_causal_mask(chunk_len, bswa_len + max_d_len, device=q.device)
 
+        state_vs, state_ks = [], []
+        for i_SO in range(T//chunk_len - self.n_bswa_chunks - 1):
+            state_k, state_v, state_k_to_store, state_v_to_store = self.inner_loop_attstate(
+                input_k_0=ln_rope_zeroed_input_k_SO[:, :, i_SO, :, :],
+                input_v=input_v_SO[:, :, i_SO, :, :], 
+                key_weighting=key_weighting_SO[:, :, i_SO, :, :], 
+                log_state_decay=log_state_decay_SO[:, :, i_SO, :, :], 
+                state_k=state_k, state_v=state_v, state_vlen=state_vlen,
+            )
+
+            state_ks.append(state_k_to_store)
+            state_vs.append(state_v_to_store)
+
+            #d_k, d_v, out = self.inner_loop_attstate(e, q, k, v, d_k, d_v, d_vlen, log_state_decay, key_weighting, causal_mask)
+            #outs.append(out)
+            
+        if self.use_head_temp:
+            front_head_temp = self.front_head_temp.view(1, H, 1, 1, 1)
+        else:
+            front_head_temp = 1
+
+        k_chunks = k_chunks * front_head_temp
         for i_SO in range(T//chunk_len - self.n_bswa_chunks - 1):
             bswa_begin_chunk = i_SO + 2
             bswa_end_chunk = bswa_begin_chunk + self.n_bswa_chunks
-            state_k, state_v, out = self.inner_loop_attstate( #e, q, k, v, d_k, d_v, d_vlen, log_state_decay, key_weighting, causal_mask)
-                q=q_chunks[:, :, bswa_end_chunk - 1, :, :],
-                c_k_0=ln_rope_zeroed_input_k_SO[:, :, i_SO, :, :],
-                c_v=input_v_SO[:, :, i_SO, :, :], 
-                bswa_k=k_chunks[:,:,bswa_begin_chunk:bswa_end_chunk,:,:].view(B, H, -1, N),
-                bswa_v=v_chunks[:,:,bswa_begin_chunk:bswa_end_chunk,:,:].view(B, H, -1, N),
-                key_weighting=key_weighting_SO[:, :, i_SO, :, :], 
-                log_state_decay=log_state_decay_SO[:, :, i_SO, :, :], 
-                d_k=state_k, d_v=state_v, d_vlen=state_vlen, causal_mask=causal_mask
-            )
-
-            #d_k, d_v, out = self.inner_loop_attstate(e, q, k, v, d_k, d_v, d_vlen, log_state_decay, key_weighting, causal_mask)
+            c_q=q_chunks[:, :, bswa_end_chunk - 1, :, :]
+            bswa_k=k_chunks[:,:,bswa_begin_chunk:bswa_end_chunk,:,:].view(B, H, -1, N)
+            bswa_v=v_chunks[:,:,bswa_begin_chunk:bswa_end_chunk,:,:].view(B, H, -1, N)
+            d_k = state_ks[i_SO]
+            d_v = state_vs[i_SO]
+            k_star = torch.cat([d_k, bswa_k], dim=-2)
+            v_star = torch.cat([d_v, bswa_v], dim=-2)
+            out = F.scaled_dot_product_attention(c_q, k_star, v_star, attn_mask=causal_mask, is_causal=False)
             outs.append(out)
 
         y = torch.cat(outs, dim=-2)
         return y
 
     @defer(torch.compile)
-    def inner_loop_attstate(self, #e, q, k, v, d_k, d_v, d_vlen, log_state_decay, key_weighting, causal_mask):
-            q,
-            c_k_0,
-            c_v, 
-            bswa_k,
-            bswa_v,
-            key_weighting, 
-            log_state_decay, 
-            d_k, d_v, d_vlen, causal_mask
-        ):
-
-        B, H, T_Q, N = q.shape
-
-        # # code for bswa-only
-        # if self.attn_type == 'bswa':
-        #     return d_k, d_v, F.scaled_dot_product_attention(q_current, bswa_k, bswa_v, attn_mask=causal_mask[:,-bswa_len:], is_causal=False)
-
-        if self.use_head_temp:
-            state_head_temp = self.state_head_temp.view(1, H, 1, 1)
-            front_head_temp = self.front_head_temp.view(1, H, 1, 1)
-        else:
-            state_head_temp = 1
-            front_head_temp = 1
-
-        attn_mask = causal_mask
-
-        d_k_norm = self.ln_d_k(d_k)
-
-        # k_star = torch.cat([d_k_norm * state_head_temp, bswa_k * front_head_temp], dim=-2)
-        # v_star = torch.cat([(F.normalize(d_v.float(), dim=-1) * d_vlen).bfloat16(), bswa_v], dim=-2)
-        # out = F.scaled_dot_product_attention(q, k_star, v_star, attn_mask=attn_mask, is_causal=False)
-
-        # sim = rms_norm(c_k_0) @ rms_norm(d_k_norm.mT) # [B, H, C_T, D_T]
-        sim = c_k_0 @ d_k_norm.mT # [B, H, C_T, D_T]
-        sim[...,0:self.sink_len] = float('-inf')
-
-        use_dense = True
-
-        if key_weighting is not None:
-            #key_weighting_current = key_weighting[:,:,bswa_begin:bswa_begin+chunk_len]
-            c_k_0 = c_k_0 * key_weighting#_current
-            c_v = c_v * key_weighting#_current
-
-        best_sim, best_d_idx = sim.max(dim=-1, keepdim=True)  # [B, H, C_T, 1]
-        if use_dense:
-            sim_max = torch.scatter(torch.zeros_like(sim), -1, best_d_idx, torch.ones_like(sim)) # [B, H, C_T, D_T]
-            if self.use_state_decay:
-                #log_state_decay_current = log_state_decay[:,:,bswa_begin:bswa_begin+chunk_len]
-                state_decay_current = torch.exp(sim_max.mT @ log_state_decay)#_current)
-                d_v = d_v * state_decay_current
-
-            d_k = d_k + (sim_max.mT @ c_k_0) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
-            d_v = d_v + (sim_max.mT @ c_v) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
-        else:
-            d_k = d_k.scatter_add(2, best_d_idx, c_k_0)
-            d_v = d_v.scatter_add(2, best_d_idx, c_v)
-
-        d_k_norm = self.ln_d_k(d_k)
-
-        k_star = torch.cat([d_k_norm * state_head_temp, bswa_k * front_head_temp], dim=-2)
-        v_star = torch.cat([(F.normalize(d_v.float(), dim=-1) * d_vlen).bfloat16(), bswa_v], dim=-2)
-        out = F.scaled_dot_product_attention(q, k_star, v_star, attn_mask=attn_mask, is_causal=False)
-
-        return d_k, d_v, out
-
-    @defer(torch.compile)
-    def calculate_updated_state_for_chunk_batch(self, input_k_0, input_v, key_weighting, log_state_decay, state_k, state_v):
+    def inner_loop_attstate(self, input_k_0, input_v, key_weighting, log_state_decay, state_k, state_v, state_vlen):
         state_k_norm = self.ln_d_k(state_k)
         sim = input_k_0 @ state_k_norm.mT # [B, H, C_T, D_T]
         sim[...,0:self.sink_len] = float('-inf')
         input_k_0 = input_k_0 * key_weighting
         input_v = input_v * key_weighting
-        best_sim, best_state_idx = sim.max(dim=-1, keepdim=True)  # [B, H, C_T, 1]
-        sim_max = torch.scatter(torch.zeros_like(sim), -1, best_state_idx, torch.ones_like(sim)) # [B, H, C_T, D_T]
+        best_sim, best_d_idx = sim.max(dim=-1, keepdim=True)  # [B, H, C_T, 1]
+        sim_max = torch.scatter(torch.zeros_like(sim), -1, best_d_idx, torch.ones_like(sim)) # [B, H, C_T, D_T]
         if self.use_state_decay:
             state_decay_compounded = torch.exp(sim_max.mT @ log_state_decay)
             state_v = state_v * state_decay_compounded
         state_k = state_k + (sim_max.mT @ input_k_0) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
         state_v = state_v + (sim_max.mT @ input_v) # [B, H, D_T, C_T] @ [B, H, C_T, N] = [B, H, D_T, N]
-        return state_k, state_v
+
+        state_k_norm = self.ln_d_k(state_k)
+        state_head_temp = self.state_head_temp.view(1, -1, 1, 1)
+        if len(state_k.shape) == 5:
+            state_head_temp.unsqueeze(-1)
+        # FIXME - in the original implementation we used state_head_temp for even the first state initialized from the original keys+values, rather than front_head_temp
+        # FIXME - we also applied ln_k and rope zeroing to it, treating it like a true state
+        state_k_to_store = state_k_norm * state_head_temp
+        state_v_to_store = (F.normalize(state_v.float(), dim=-1) * state_vlen).to(state_v.dtype)
+        return state_k, state_v, state_k_to_store, state_v_to_store
 
     def apply_rope_zeroing_and_ln(self, x):
         if self.use_rope and self.rope_zeroing:
@@ -387,22 +348,12 @@ class CausalSelfAttention(nn.Module):
 
             # create the updated states for this chunk batch
             end_chunk_SO = begin_chunk_SO + batch_length_SO
-            state_k, state_v = self.calculate_updated_state_for_chunk_batch(
+            state_k, state_v, state_k_to_store, state_v_to_store = self.inner_loop_attstate(
                 input_k_0=ln_rope_zeroed_input_k_SO[:, :, begin_chunk_SO:end_chunk_SO, :, :],
                 input_v=input_v_SO[:, :, begin_chunk_SO:end_chunk_SO, :, :], 
                 key_weighting=key_weighting_SO[:, :, begin_chunk_SO:end_chunk_SO, :, :], 
                 log_state_decay=log_state_decay_SO[:, :, begin_chunk_SO:end_chunk_SO, :, :], 
-                state_k=state_k, state_v=state_v)
-
-            # keep these separate so we don't mess up the current state
-            state_k_to_store, state_v_to_store = state_k, state_v
-            if self.use_head_temp:
-                # FIXME - in the original implementation we used state_head_temp for even the first state initialized from the original keys+values, rather than front_head_temp
-                # FIXME - we also applied ln_k and rope zeroing to it, treating it like a true state
-                state_head_temp = self.state_head_temp.view(1, H, 1, 1, 1)
-                state_k_to_store = state_k_to_store * state_head_temp
-            # we normalize state_v_to_store and multiply by state_vlen when storing it because v_star = torch.cat([(F.normalize(state_v.float(), dim=-1) * state_vlen).bfloat16(), bswa_v], dim=2)
-            state_v_to_store = (F.normalize(state_v_to_store.float(), dim=-1) * state_vlen).to(state_v_to_store.dtype)
+                state_k=state_k, state_v=state_v, state_vlen=state_vlen)
 
             state_ks.append(state_k_to_store.reshape(*state_k_to_store.shape[:2], -1, *state_k_to_store.shape[4:]))
             state_vs.append(state_v_to_store.reshape(*state_v_to_store.shape[:2], -1, *state_v_to_store.shape[4:]))
