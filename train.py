@@ -382,7 +382,7 @@ if master_process:
 cu_seqlens = None
 if args.data_packing == 'varlen':
     cu_seqlens = [0,args.sequence_length]
-loss = model(torch.zeros([1,args.sequence_length], dtype=torch.long), torch.zeros([1,args.sequence_length], dtype=torch.long), cu_seqlens)['loss']
+loss = model(torch.zeros([1,args.sequence_length], dtype=torch.long), torch.zeros([1,args.sequence_length], dtype=torch.long), cu_seqlens=cu_seqlens, return_acc=False)['loss']
 loss.backward()
 if master_process:
     print(f"Done. {int(1000 * (time.time() - t0))}ms")
@@ -874,7 +874,7 @@ for step in range(args.num_iterations + 1):
                 val_datum = next(val_loader)
                 x_val, y_val, cu_seqlens_val, attention_mask_val = val_datum['input_ids'], val_datum['labels'], val_datum.get('cu_seqlens'), val_datum.get('attention_mask')
                 #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                val_results = model(x_val, y_val, cu_seqlens_val, return_acc=True)
+                val_results = model(x_val, y_val, cu_seqlens=cu_seqlens_val, return_acc=True)
                 val_loss += val_results['loss']
                 val_acc += val_results['acc']
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -932,7 +932,7 @@ for step in range(args.num_iterations + 1):
 
         # forward pass
         #with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        loss = model(x, y, cu_seqlens, return_acc=False)['loss']
+        loss = model(x, y, cu_seqlens=cu_seqlens, return_acc=False)['loss']
 
         # backward pass
         if i < train_accumulation_steps:

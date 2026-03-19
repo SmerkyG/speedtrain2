@@ -706,7 +706,7 @@ class GPT(nn.Module):
         #     assert False, f"unimplemented attn type {attn.attn_type}"
 
         positional_embeddings = create_rotary_embeddings(x.device, self.head_dim, self.config.rope_partial_dim, base=self.config.rope_theta, seq_len=q_len)
-        layer_kwargs = dict(v1=v1, dx0=dx0, token_ids=token_ids, positional_embeddings=positional_embeddings, block_mask=block_mask, state_update_chunk_batch_lengths=state_update_chunk_batch_lengths, state_update_chunk_indices=state_update_chunk_indices, sink_mask=sink_mask)
+        layer_kwargs = dict(x0=x0, v1=v1, dx0=dx0, token_ids=token_ids, positional_embeddings=positional_embeddings, block_mask=block_mask, state_update_chunk_batch_lengths=state_update_chunk_batch_lengths, state_update_chunk_indices=state_update_chunk_indices, sink_mask=sink_mask)
 
         # positional_embeddings = create_rotary_embeddings(x.device, self.head_dim, self.config.rope_partial_dim, base=self.config.rope_theta, seq_len=B*T)
         # sink_mask = torch.zeros([B,T], dtype=torch.bool, device=x.device)
@@ -719,7 +719,7 @@ class GPT(nn.Module):
 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            x = maybe_ckpt(self.transformer.h[i], x, x0=x0, **layer_kwargs)
+            x = maybe_ckpt(self.transformer.h[i], x, **layer_kwargs)
             if self.config.use_skip_connections:
                 skip_connections.append(x)  # Store the output for skip connections
 
@@ -728,7 +728,7 @@ class GPT(nn.Module):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
-            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, x0=x0, **layer_kwargs)
+            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, **layer_kwargs)
 
         return self.unembed(x, target, return_acc)
 

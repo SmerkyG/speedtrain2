@@ -293,7 +293,7 @@ class GPT(nn.Module):
         dx0 = F.pad(x, [0,0,1,-1]) - x
         return x, dx0
 
-    def forward(self, token_ids, target, return_acc=False):
+    def forward(self, token_ids, target, cu_seqlens=None, return_acc=False):
         # forward the GPT model itself
         x, dx0 = self.embed(token_ids)
         x0 = x
@@ -301,9 +301,11 @@ class GPT(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
 
+        layer_kwargs = dict(x0=x0, dx0=dx0, token_ids=token_ids)
+
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            x = maybe_ckpt(self.transformer.h[i], x, x0, dx0, token_ids)
+            x = maybe_ckpt(self.transformer.h[i], x, **layer_kwargs)
             if self.config.use_skip_connections:
                 skip_connections.append(x)  # Store the output for skip connections
 
@@ -312,7 +314,7 @@ class GPT(nn.Module):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
-            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, x0, dx0, token_ids)
+            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, **layer_kwargs)
 
         return self.unembed(x, target, return_acc)
 

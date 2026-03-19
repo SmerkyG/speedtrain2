@@ -629,7 +629,7 @@ class CausalSelfAttention(nn.Module):
         return d_k, d_v, out
 
     @defer(torch.compile)
-    def forward(self, residual, x, v1, x0, dx0, token_ids):
+    def forward(self, residual, x, v1, x0, dx0, token_ids, **kwargs):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (d_embed)
         H = self.n_head
         N = self.head_dim
@@ -786,11 +786,11 @@ class Block(nn.Module):
         if self.config.use_block_lambdas:
             self.lambdas = set_label('scalars', nn.Parameter(torch.tensor([1., 0.])))
     
-    def forward(self, x, v1, x0, dx0, token_ids):
+    def forward(self, x, x0, **kwargs):
         if self.config.use_block_lambdas:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x = self.attn(x, self.attn.ln_res(x), v1, x0, dx0, token_ids)
-        x = self.mlp(x, self.mlp.ln_res(x))
+        x = self.attn(x, self.attn.ln_res(x), x0=x0, **kwargs)
+        x = self.mlp(x, self.mlp.ln_res(x), x0=x0, **kwargs)
         return x
 
 # -----------------------------------------------------------------------------
@@ -833,7 +833,7 @@ class GPT(nn.Module):
         dx0 = F.pad(x, [0,0,1,-1]) - x
         return x, dx0
 
-    def forward(self, token_ids, target, return_acc=False):
+    def forward(self, token_ids, target, cu_seqlens=None, return_acc=False):
         # forward the GPT model itself
         x, dx0 = self.embed(token_ids)
         x0 = x
@@ -844,9 +844,11 @@ class GPT(nn.Module):
         # Store outputs for U-Net skip connections
         skip_connections = []
 
+        layer_kwargs = dict(x0=x0, v1=v1, dx0=dx0, token_ids=token_ids)
+
         # Encoder pass - process only the first half of the blocks
         for i in range(self.encoder_layers):
-            x = maybe_ckpt(self.transformer.h[i], x, v1, x0, dx0, token_ids)
+            x = maybe_ckpt(self.transformer.h[i], x, **layer_kwargs)
             if self.config.use_skip_connections:
                 skip_connections.append(x)  # Store the output for skip connections
 
@@ -855,7 +857,7 @@ class GPT(nn.Module):
             skip_connection = skip_connections.pop()  # Get the corresponding encoder output
             # Apply learnable weight to skip connection
             weighted_skip = self.skip_weights[i] * skip_connection
-            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, v1, x0, dx0, token_ids)
+            x = maybe_ckpt(self.transformer.h[self.encoder_layers + i], x + weighted_skip, **layer_kwargs)
 
         return self.unembed(x, target, return_acc)
 

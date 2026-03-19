@@ -256,7 +256,7 @@ class GPT(nn.Module):
 
         # Encoder pass - process only the first half of the blocks
         for i in range(self.config.n_layer):
-            x = self.transformer.h[i](x, v1, x0, dx0, block_mask)
+            x = maybe_ckpt(self.transformer.h[i], x, v1, x0, dx0, block_mask)
 
         return self.unembed(x, target, return_acc)
 
